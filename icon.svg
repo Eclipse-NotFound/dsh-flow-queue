@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Flow queue">
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="#101216"/>
+  <path d="M12 22h9M12 42h9" stroke="#7aa2f7" stroke-width="3.2" stroke-linecap="round" fill="none"/>
+  <path d="M21 22h4M21 42h4" stroke="#7aa2f7" stroke-width="3.2" stroke-linecap="round" fill="none"/>
+  <rect x="25" y="15" width="26" height="14" rx="4.5" stroke="#7aa2f7" stroke-width="3.2" fill="none"/>
+  <rect x="25" y="35" width="26" height="14" rx="4.5" stroke="#f7c948" stroke-width="3.2" fill="none"/>
+  <path d="M40 33.5l-6.5 9h5l-1.5 8 7-10h-5l1-7z" fill="#f7c948"/>
+</svg>

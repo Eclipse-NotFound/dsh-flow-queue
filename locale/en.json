@@ -1,0 +1,6 @@
+{
+	"meta": {
+		"title": "Flow Queue",
+		"description": "Stage prompts and model switches as an action queue that only advances at a turn boundary; a right-sidebar panel shows each step's live state."
+	}
+}

@@ -1,0 +1,13 @@
+# dsh-flow-queue — visual flow queue.
+#
+# The Host half owns one flow graph per Session and advances it only at a turn
+# boundary (`turn/end` plus an idle Agent), so a model switch can never land
+# inside an in-flight request or one of its retries. The Client half registers a
+# right-sidebar tab and a frame-wide flow editor.
+#
+# The row targets a versioned `./hostN` subpath rather than a stable entry: a
+# running Harness caches a module by resolved URL, so pointing at a fresh file is
+# how Host updates become live without restarting the app.
+- insert:
+    - id: flow-queue
+      name: dsh-flow-queue/host2
