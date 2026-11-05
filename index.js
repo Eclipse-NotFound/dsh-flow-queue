@@ -173,12 +173,14 @@ function normalizeNode(input) {
 			if (typeof input.provider === 'string' && input.provider !== '') node.provider = input.provider.slice(0, MAX_IDENT_CHARS);
 			if (typeof input.model === 'string' && input.model !== '') node.model = input.model.slice(0, MAX_IDENT_CHARS);
 			if (typeof input.modelLabel === 'string' && input.modelLabel !== '') node.modelLabel = input.modelLabel.slice(0, MAX_IDENT_CHARS);
+			if (typeof input.reasoningEffort === 'string' && input.reasoningEffort !== '') node.reasoningEffort = input.reasoningEffort.slice(0, 64);
 			break;
 		}
 		case 'model': {
 			node.provider = typeof input.provider === 'string' ? input.provider.slice(0, MAX_IDENT_CHARS) : '';
 			node.model = typeof input.model === 'string' ? input.model.slice(0, MAX_IDENT_CHARS) : '';
 			node.modelLabel = typeof input.modelLabel === 'string' ? input.modelLabel.slice(0, MAX_IDENT_CHARS) : '';
+			if (typeof input.reasoningEffort === 'string' && input.reasoningEffort !== '') node.reasoningEffort = input.reasoningEffort.slice(0, 64);
 			break;
 		}
 		case 'command': {
@@ -563,7 +565,9 @@ export function apply(ctx, config = {}) {
 	function modelPartsOf(node) {
 		if (node.provider === undefined || node.model === undefined) return undefined;
 		if (node.provider === '' || node.model === '') return undefined;
-		return { provider: node.provider, model: node.model };
+		const parts = { provider: node.provider, model: node.model };
+		if (typeof node.reasoningEffort === 'string' && node.reasoningEffort !== '') parts.reasoningEffort = node.reasoningEffort;
+		return parts;
 	}
 
 	async function attachmentsOf(node) {
@@ -600,7 +604,9 @@ export function apply(ctx, config = {}) {
 			case 'model': {
 				touchNode(node, 'running');
 				await persist(sessionId, graph);
-				await ctx.sessionController.selectModel({ sessionId, provider: node.provider, model: node.model });
+				const selection = { sessionId, provider: node.provider, model: node.model };
+				if (typeof node.reasoningEffort === 'string' && node.reasoningEffort !== '') selection.reasoningEffort = node.reasoningEffort;
+				await ctx.sessionController.selectModel(selection);
 				touchNode(node, 'completed');
 				// Configuration changes do not overwrite the work outcome that
 				// conditions are evaluated against.
@@ -977,6 +983,12 @@ export function apply(ctx, config = {}) {
 		else if (typeof patch.model === 'string') node.model = patch.model.slice(0, MAX_IDENT_CHARS);
 		if (patch.modelLabel === null) delete node.modelLabel;
 		else if (typeof patch.modelLabel === 'string') node.modelLabel = patch.modelLabel.slice(0, MAX_IDENT_CHARS);
+		if (patch.reasoningEffort === null) delete node.reasoningEffort;
+		else if (typeof patch.reasoningEffort === 'string') {
+			const effort = patch.reasoningEffort.trim().slice(0, 64);
+			if (effort === '') delete node.reasoningEffort;
+			else node.reasoningEffort = effort;
+		}
 	}
 
 	async function addAttachment(graph, node, payload) {
@@ -1028,6 +1040,7 @@ export function apply(ctx, config = {}) {
 					provider: payload.provider,
 					model: payload.model,
 					modelLabel: payload.modelLabel,
+					reasoningEffort: payload.reasoningEffort,
 					condition: payload.condition,
 					maxIterations: payload.maxIterations,
 					note: payload.note,

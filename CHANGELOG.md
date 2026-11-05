@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## 0.2.4 — 2026-11-05
+
+- Editing no longer takes the canvas away: a click opens the inspector as a drawer under the canvas, so dragging a step is never interrupted by a layout swap. A press that does not move counts as the click; the whole card is the drag handle.
+- Connections can be drawn either way: drag from an output dot onto the target step, or click the dot and then click the target step (Esc and a click on empty canvas cancel). A release after a real drag connects; a release without movement only arms the connection.
+- Model steps carry the model's reasoning effort when it declares levels; the picker appears under the model selector and keeps the current effort only when the newly chosen model supports it.
+
 ## 0.2.3 — 2026-11-05
 
 - The right sidebar's start page clips its card list instead of scrolling, so the last entries (including "more tools") become unreachable once several plugins register tabs. The plugin now renders its own card there and, while that card is mounted, finds the container that actually clips and switches it to scrolling; the original inline styles are restored on unmount.

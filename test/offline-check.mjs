@@ -222,7 +222,7 @@ async function cleanup(harness) {
 	const h = await makeHarness();
 	h.world.agentStatus = 'running';
 
-	const first = await h.command({ op: 'node.add', kind: 'model', provider: 'acme', model: 'model-b', modelLabel: 'Model B' });
+	const first = await h.command({ op: 'node.add', kind: 'model', provider: 'acme', model: 'model-b', modelLabel: 'Model B', reasoningEffort: 'high' });
 	const prompt = await h.command({ op: 'node.add', kind: 'prompt', text: 'write the patch' });
 	await h.command({ op: 'edge.add', from: first.node.id, port: 'next', to: prompt.node.id });
 
@@ -237,8 +237,8 @@ async function cleanup(harness) {
 	await waitFor(() => h.world.calls.prompt.length === 1, 'the prompt after the switch');
 
 	assert.deepEqual(
-		{ provider: h.world.calls.selectModel[0].provider, model: h.world.calls.selectModel[0].model },
-		{ provider: 'acme', model: 'model-b' },
+		{ provider: h.world.calls.selectModel[0].provider, model: h.world.calls.selectModel[0].model, reasoningEffort: h.world.calls.selectModel[0].reasoningEffort },
+		{ provider: 'acme', model: 'model-b', reasoningEffort: 'high' },
 	);
 	// The switch landed on the boundary, before this prompt was admitted.
 	assert.equal(h.world.calls.prompt.length, 1);

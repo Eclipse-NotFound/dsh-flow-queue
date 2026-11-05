@@ -73,6 +73,8 @@ window.__ModuleLoader__.load({
 				'inspector.command': '命令（例如 /compact）',
 				'inspector.model': '模型',
 				'inspector.modelInherit': '不设置（沿用当前）',
+				'inspector.reasoning': '思考强度',
+				'inspector.reasoningDefault': '模型默认',
 				'inspector.note': '断点说明',
 				'inspector.condition': '条件',
 				'inspector.conditionValue': '匹配内容',
@@ -180,6 +182,8 @@ window.__ModuleLoader__.load({
 				'inspector.command': 'Command (for example /compact)',
 				'inspector.model': 'Model',
 				'inspector.modelInherit': 'Not set (keep current)',
+				'inspector.reasoning': 'Reasoning effort',
+				'inspector.reasoningDefault': 'Model default',
 				'inspector.note': 'Checkpoint note',
 				'inspector.condition': 'Condition',
 				'inspector.conditionValue': 'Match value',
@@ -511,7 +515,10 @@ window.__ModuleLoader__.load({
 				const count = Array.isArray(node.attachments) ? node.attachments.length : 0;
 				return `${head}${text.length > 80 ? '…' : ''}${count > 0 ? `  📎${count}` : ''}`;
 			}
-			if (node.kind === 'model') return `${node.provider || '?'} / ${node.model || '?'}`;
+			if (node.kind === 'model') {
+				const effort = typeof node.reasoningEffort === 'string' && node.reasoningEffort !== '' ? ` · ${node.reasoningEffort}` : '';
+				return `${node.provider || '?'} / ${node.model || '?'}${effort}`;
+			}
 			if (node.kind === 'command') return node.command || t('kind.command');
 			if (node.kind === 'checkpoint') return node.note || t('kind.checkpoint');
 			if (node.kind === 'branch' || node.kind === 'loop') {
@@ -639,18 +646,21 @@ window.__ModuleLoader__.load({
 			const body = nodeSummary(node, t);
 			return h(
 				'div',
-				{ 'data-fq-node': node.id, style: cardStyle },
+				{
+					'data-fq-node': node.id,
+					style: cardStyle,
+					// The whole card is the drag handle: moving it never swaps the
+					// panel body, and a press that does not move counts as a click.
+					onPointerDown: (event) => {
+						if (event.button !== 0) return;
+						event.stopPropagation();
+						props.onSelect(node.id);
+						props.onDragStart(node.id, event);
+					},
+				},
 				h(
 					'div',
-					{
-						style: headStyle,
-						onPointerDown: (event) => {
-							if (event.button !== 0) return;
-							event.stopPropagation();
-							props.onSelect(node.id);
-							props.onDragStart(node.id, event);
-						},
-					},
+					{ style: headStyle },
 					h(StatusDot, { color: statusColor(status), pulse: running }),
 					h('span', { style: { fontSize: '10px', border: `1px solid ${color}`, borderRadius: '999px', padding: '0 6px', lineHeight: '15px', color } }, t(`kind.${node.kind}`)),
 					h('span', { style: { flex: 1, minWidth: 0, fontSize: '11px', color: C.dim, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, t(`status.${status}`)),
@@ -714,7 +724,7 @@ window.__ModuleLoader__.load({
 			const [connecting, setConnecting] = useState(null);
 			const [pointer, setPointer] = useState({ x: 0, y: 0 });
 			const dragRef = useRef(null);
-			const connectingRef = useRef(null);
+			const connectRef = useRef(null);
 			const panRef = useRef(null);
 			const viewRef = useRef(view);
 			const handlersRef = useRef(props);
@@ -740,9 +750,31 @@ window.__ModuleLoader__.load({
 				};
 			}, []);
 
-			// One stable pair of document listeners: dragging and connecting read the
-			// live refs above, so a re-render never drops a pointer event.
+			// One stable set of document listeners: dragging, panning and connecting
+			// read the live refs, so a re-render never drops a pointer event.
 			useEffect(() => {
+				const movedEnough = (start, event) => Math.abs(event.clientX - start.x) + Math.abs(event.clientY - start.y) > 4;
+				const cardUnder = (event) => {
+					const target = event.target !== null && event.target !== undefined && event.target.closest !== undefined
+						? event.target.closest('[data-fq-node]')
+						: null;
+					return target === null || target === undefined ? null : target.getAttribute('data-fq-node');
+				};
+				const cancelConnect = () => {
+					connectRef.current = null;
+					setConnecting(null);
+				};
+				const connectTo = (clientX, clientY) => {
+					const target = document.elementFromPoint(clientX, clientY);
+					const holder = target === null ? null : target.closest('[data-fq-node]');
+					const connect = connectRef.current;
+					if (connect === null || holder === null) return false;
+					const to = holder.getAttribute('data-fq-node');
+					if (to === null || to === connect.from) return false;
+					cancelConnect();
+					handlersRef.current.onConnect(connect.from, connect.port, to);
+					return true;
+				};
 				const onMove = (event) => {
 					const point = toCanvas(event.clientX, event.clientY);
 					if (panRef.current !== null) {
@@ -751,51 +783,67 @@ window.__ModuleLoader__.load({
 						return;
 					}
 					if (dragRef.current !== null) {
-						const base = dragRef.current;
-						handlersRef.current.onMove(base.id, Math.max(0, point.x - base.dx), Math.max(0, point.y - base.dy));
+						const drag = dragRef.current;
+						if (!drag.moved && movedEnough(drag, event)) drag.moved = true;
+						if (drag.moved) handlersRef.current.onMove(drag.id, Math.max(0, point.x - drag.dx), Math.max(0, point.y - drag.dy));
 						return;
 					}
-					if (connectingRef.current !== null) setPointer(point);
+					const connect = connectRef.current;
+					if (connect !== null) {
+						if (!connect.moved && movedEnough(connect, event)) connect.moved = true;
+						setPointer(point);
+					}
+				};
+				// Capture phase: while a connection is armed by a click, the next
+				// pointerdown on a step completes it instead of starting a drag.
+				const onDown = (event) => {
+					const connect = connectRef.current;
+					if (connect === null || connect.moved === true) return;
+					const id = cardUnder(event);
+					if (id === null || id === connect.from) {
+						cancelConnect();
+						return;
+					}
+					event.preventDefault();
+					event.stopPropagation();
+					connectTo(event.clientX, event.clientY);
 				};
 				const onUp = (event) => {
 					if (panRef.current !== null) {
 						panRef.current = null;
 						return;
 					}
-					if (connectingRef.current !== null) {
-						const connection = connectingRef.current;
-						connectingRef.current = null;
-						setConnecting(null);
-						const target = document.elementFromPoint(event.clientX, event.clientY);
-						const holder = target === null ? null : target.closest('[data-fq-node]');
-						if (holder !== null) {
-							const to = holder.getAttribute('data-fq-node');
-							if (to !== null && to !== connection.from) handlersRef.current.onConnect(connection.from, connection.port, to);
-						}
+					const connect = connectRef.current;
+					if (connect !== null) {
+						// A press without movement only arms the connection; the release
+						// after a real drag either connects to the step under the pointer
+						// or gives up.
+						if (connect.moved !== true) return;
+						if (!connectTo(event.clientX, event.clientY)) cancelConnect();
 						return;
 					}
-					if (dragRef.current !== null) {
-						const base = dragRef.current;
+					const drag = dragRef.current;
+					if (drag !== null) {
 						dragRef.current = null;
-						handlersRef.current.onCommitMove(base.id);
+						if (drag.moved) handlersRef.current.onCommitMove(drag.id);
+						else handlersRef.current.onClickNode(drag.id);
 					}
 				};
 				const onKey = (event) => {
 					if (event.key !== 'Escape') return;
-					if (connectingRef.current !== null) {
-						connectingRef.current = null;
-						setConnecting(null);
-					}
+					if (connectRef.current !== null) cancelConnect();
 					if (dragRef.current !== null) {
-						const base = dragRef.current;
+						const drag = dragRef.current;
 						dragRef.current = null;
-						handlersRef.current.onCancelMove(base.id);
+						handlersRef.current.onCancelMove(drag.id);
 					}
 				};
+				document.addEventListener('pointerdown', onDown, true);
 				document.addEventListener('pointermove', onMove);
 				document.addEventListener('pointerup', onUp);
 				document.addEventListener('keydown', onKey);
 				return () => {
+					document.removeEventListener('pointerdown', onDown, true);
 					document.removeEventListener('pointermove', onMove);
 					document.removeEventListener('pointerup', onUp);
 					document.removeEventListener('keydown', onKey);
@@ -807,12 +855,12 @@ window.__ModuleLoader__.load({
 				const node = nodesByIdRef.current.get(id);
 				if (node === undefined) return;
 				const point = toCanvas(event.clientX, event.clientY);
-				dragRef.current = { id, dx: point.x - node.x, dy: point.y - node.y };
+				dragRef.current = { id, dx: point.x - node.x, dy: point.y - node.y, startX: event.clientX, startY: event.clientY, moved: false };
 			}, [toCanvas]);
 
 			const startPort = useCallback((id, port, event) => {
 				if (handlersRef.current.busy === true) return;
-				connectingRef.current = { from: id, port };
+				connectRef.current = { from: id, port, startX: event.clientX, startY: event.clientY, moved: false };
 				setConnecting({ from: id, port });
 				setPointer(toCanvas(event.clientX, event.clientY));
 			}, [toCanvas]);
@@ -933,6 +981,25 @@ window.__ModuleLoader__.load({
 
 		//#region inspector
 
+		/** One catalog model, by provider and model id. */
+		function catalogModel(catalog, provider, model) {
+			if (catalog === null || catalog === undefined || !Array.isArray(catalog.groups)) return undefined;
+			for (const group of catalog.groups) {
+				if (group === null || group === undefined || group.id !== provider) continue;
+				for (const entry of Array.isArray(group.models) ? group.models : []) {
+					if (entry !== null && entry !== undefined && entry.id === model) return entry;
+				}
+			}
+			return undefined;
+		}
+
+		/** The reasoning efforts a model declares, if any. */
+		function effortsOf(catalog, provider, model) {
+			const entry = catalogModel(catalog, provider, model);
+			if (entry === undefined || entry.reasoning === undefined || entry.reasoning === null) return [];
+			return Array.isArray(entry.reasoning.efforts) ? entry.reasoning.efforts : [];
+		}
+
 		function ModelSelect(props) {
 			const groups = props.catalog !== null && Array.isArray(props.catalog.groups) ? props.catalog.groups : [];
 			const value = props.allowEmpty === true && (props.value === undefined || props.value === '') ? '' : props.value;
@@ -954,11 +1021,40 @@ window.__ModuleLoader__.load({
 						if (raw === '') return props.onChange(undefined);
 						const [provider, model] = raw.split('\u0000');
 						const chosen = options.find((option) => option.value === raw);
-						props.onChange({ provider, model, label: chosen === undefined ? model : chosen.label });
+						// Keep the current effort only when the new model declares it.
+						const efforts = effortsOf(props.catalog, provider, model);
+						const kept = efforts.some((effort) => effort.id === props.effort) ? props.effort : null;
+						props.onChange({ provider, model, label: chosen === undefined ? model : chosen.label, reasoningEffort: kept });
 					},
 				},
 				props.allowEmpty === true ? h('option', { value: '' }, ttext('inspector.modelInherit')) : null,
 				options.map((option) => h('option', { key: option.value, value: option.value }, option.label)),
+			);
+		}
+
+		/** Reasoning-effort picker for one provider/model, hidden when unsupported. */
+		function EffortSelect(props) {
+			const t = props.t;
+			const efforts = effortsOf(props.catalog, props.provider, props.model);
+			if (efforts.length === 0) return null;
+			const defaultEffort = catalogModel(props.catalog, props.provider, props.model).reasoning;
+			const defaultValue = defaultEffort !== undefined && defaultEffort !== null && typeof defaultEffort.defaultEffort === 'string' ? defaultEffort.defaultEffort : '';
+			const current = typeof props.value === 'string' && props.value !== '' ? props.value : '';
+			return h(
+				Field,
+				{ label: t('inspector.reasoning') },
+				h(
+					'select',
+					{
+						style: inputStyle,
+						value: current,
+						onChange: (event) => props.onChange(event.target.value === '' ? null : event.target.value),
+					},
+					h('option', { value: '' }, defaultValue === '' ? t('inspector.reasoningDefault') : `${t('inspector.reasoningDefault')} (${defaultValue})`),
+					efforts
+						.filter((effort) => effort !== null && effort !== undefined && typeof effort.id === 'string')
+						.map((effort) => h('option', { key: effort.id, value: effort.id }, effort.name || effort.id)),
+				),
 			);
 		}
 
@@ -1037,11 +1133,26 @@ window.__ModuleLoader__.load({
 					h(ModelSelect, {
 						catalog: props.catalog,
 						allowEmpty: true,
+						effort: node.reasoningEffort,
 						value: node.provider !== undefined && node.model !== undefined ? `${node.provider}\u0000${node.model}` : '',
 						onChange: (selection) => {
-							if (selection === undefined) patch({ provider: null, model: null, modelLabel: null });
-							else patch({ provider: selection.provider, model: selection.model, modelLabel: selection.label });
+							if (selection === undefined) patch({ provider: null, model: null, modelLabel: null, reasoningEffort: null });
+							else patch({
+								provider: selection.provider,
+								model: selection.model,
+								modelLabel: selection.label,
+								reasoningEffort: selection.reasoningEffort === undefined ? null : selection.reasoningEffort,
+							});
 						},
+					})));
+				rows.push(h('div', { key: 'effort' },
+					h(EffortSelect, {
+						t,
+						catalog: props.catalog,
+						provider: node.provider,
+						model: node.model,
+						value: node.reasoningEffort,
+						onChange: (effort) => patch({ reasoningEffort: effort }),
 					})));
 				rows.push(h(Field, { key: 'attachments', label: t('inspector.attachments') },
 					h(AttachmentList, {
@@ -1062,11 +1173,26 @@ window.__ModuleLoader__.load({
 				rows.push(h(Field, { key: 'model', label: t('inspector.model') },
 					h(ModelSelect, {
 						catalog: props.catalog,
+						effort: node.reasoningEffort,
 						value: node.provider !== undefined && node.model !== undefined ? `${node.provider}\u0000${node.model}` : '',
 						onChange: (selection) => {
 							if (selection === undefined) return;
-							patch({ provider: selection.provider, model: selection.model, modelLabel: selection.label });
+							patch({
+								provider: selection.provider,
+								model: selection.model,
+								modelLabel: selection.label,
+								reasoningEffort: selection.reasoningEffort === undefined ? null : selection.reasoningEffort,
+							});
 						},
+					})));
+				rows.push(h('div', { key: 'effort' },
+					h(EffortSelect, {
+						t,
+						catalog: props.catalog,
+						provider: node.provider,
+						model: node.model,
+						value: node.reasoningEffort,
+						onChange: (effort) => patch({ reasoningEffort: effort }),
 					})));
 			}
 
@@ -1203,6 +1329,7 @@ window.__ModuleLoader__.load({
 			const [packages, setPackages] = useState([]);
 			const [selected, setSelected] = useState('');
 			const [sheet, setSheet] = useState('');
+			const [inspectorOpen, setInspectorOpen] = useState(false);
 			const [menuOpen, setMenuOpen] = useState(false);
 			const [busy, setBusy] = useState(false);
 			const [error, setError] = useState(null);
@@ -1439,7 +1566,7 @@ window.__ModuleLoader__.load({
 
 			const canvasArea = h(
 				'div',
-				{ style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', padding: '8px', gap: '6px' } },
+				{ style: { flex: 1, minHeight: '160px', display: 'flex', flexDirection: 'column', padding: '8px', gap: '6px' } },
 				h(FlowCanvas, {
 					t,
 					nodes: renderedNodes,
@@ -1448,6 +1575,12 @@ window.__ModuleLoader__.load({
 					busy,
 					onSelect: (id) => {
 						setSelected(id);
+						if (id === '') setInspectorOpen(false);
+						setSheet('');
+					},
+					onClickNode: (id) => {
+						setSelected(id);
+						setInspectorOpen(true);
 						setSheet('');
 					},
 					onMove: moveNode,
@@ -1460,11 +1593,21 @@ window.__ModuleLoader__.load({
 
 			const inspectorArea = h(
 				'div',
-				{ style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } },
+				{
+					style: {
+						flex: '0 0 auto',
+						maxHeight: '46%',
+						minHeight: '150px',
+						display: 'flex',
+						flexDirection: 'column',
+						borderTop: `1px solid ${C.border}`,
+						background: C.surface,
+					},
+				},
 				h(
 					'div',
-					{ style: { display: 'flex', alignItems: 'center', gap: '6px', padding: '6px 10px', borderBottom: `1px solid ${C.border}` } },
-					h(Button, { compact: true, onClick: () => setSelected(''), title: t('action.back') }, '←'),
+					{ style: { display: 'flex', alignItems: 'center', gap: '6px', padding: '6px 10px', borderBottom: `1px solid ${C.border}`, flex: 'none' } },
+					h(Button, { compact: true, onClick: () => setInspectorOpen(false), title: t('action.back') }, '↓'),
 					h('span', { style: { fontSize: '12px', fontWeight: 600, color: C.text } }, t('inspector.title')),
 					h('span', { style: { flex: 1 } }),
 					h(Button, {
@@ -1473,6 +1616,7 @@ window.__ModuleLoader__.load({
 						onClick: () => {
 							if (selectedNode === undefined) return;
 							const id = selectedNode.id;
+							setInspectorOpen(false);
 							setSelected('');
 							void run({ op: 'run.from', id });
 						},
@@ -1484,6 +1628,7 @@ window.__ModuleLoader__.load({
 						onClick: () => {
 							if (selectedNode === undefined) return;
 							const id = selectedNode.id;
+							setInspectorOpen(false);
 							setSelected('');
 							void run({ op: 'node.remove', id });
 						},
@@ -1505,10 +1650,12 @@ window.__ModuleLoader__.load({
 								.catch((err) => { if (mounted.current) setError(err.message || String(err)); });
 						},
 						onDelete: (id) => {
+							setInspectorOpen(false);
 							setSelected('');
 							void run({ op: 'node.remove', id });
 						},
 						onRunFrom: (id) => {
+							setInspectorOpen(false);
 							setSelected('');
 							void run({ op: 'run.from', id });
 						},
@@ -1556,7 +1703,17 @@ window.__ModuleLoader__.load({
 				),
 			);
 
-			const body = selectedNode !== undefined ? inspectorArea : sheet === 'library' ? libraryArea : canvasArea;
+			// The canvas always stays mounted: a click only opens the inspector
+			// drawer underneath it, so dragging a step or dragging a connection is
+			// never interrupted by a layout swap.
+			const body = sheet === 'library'
+				? libraryArea
+				: h(
+					'div',
+					{ style: { flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' } },
+					canvasArea,
+					inspectorOpen && selectedNode !== undefined ? inspectorArea : null,
+				);
 
 			const footer = h(
 				'div',

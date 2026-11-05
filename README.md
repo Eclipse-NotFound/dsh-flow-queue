@@ -18,8 +18,8 @@ The plugin registers one right-sidebar tab, and the whole canvas lives inside it
 
 - **Top row** — run state, start / pause / resume / stop, and a `⋯` menu (auto layout, packages, reset, clear).
 - **Second row** — `+Prompt` `+Model` `+Command` `+Branch` `+Loop` `+Checkpoint`; one click adds a step.
-- **Canvas** — drag cards to arrange them; drag from a card's right dot onto another card to connect (branches and loops expose two output dots: yes/no, again/exit); click a connection to remove it; drag empty canvas to pan, and `−` / `+` / `⤢` at the bottom-right control zoom.
-- **Select a step** — the canvas area becomes that step's inspector (← goes back), with fields for its kind and "run from here" / "delete" in the header.
+- **Canvas** — the whole card is the drag handle; drag from a card's right dot onto another card to connect (branches and loops expose two output dots: yes/no, again/exit), or click the dot and then click the target card; click a connection to remove it; drag empty canvas to pan, and `−` / `+` / `⤢` at the bottom-right control zoom.
+- **Select a step** — a click (a press that does not move) opens that step's inspector as a drawer under the canvas, so the canvas keeps its place and dragging is never interrupted; the drawer header offers "run from here" / "delete", and ↓ closes it.
 - **Packages** — `⋯ → Packages` saves, loads and deletes reusable flows in the same panel.
 
 Two entry points open it: the icon beside Settings at the sidebar foot, and the "Flow queue" card on the right sidebar's start page. That start page lists one card per tab type and clips its overflow instead of scrolling, so with enough plugins installed the last cards become unreachable; the plugin's own card walks up to the container that clips and turns on scrolling while it is mounted (the original inline styles come back when it unmounts).
@@ -29,7 +29,7 @@ Two entry points open it: the icon beside Settings at the sidebar foot, and the 
 | Type | What it does | Outputs |
 |---|---|---|
 | Prompt | Delivers one user message (optional image and file attachments; optional model for this step only) | next |
-| Model switch | Switches the session's model at the next turn boundary | next |
+| Model switch | Switches the session's model at the next turn boundary, including the reasoning effort when the model declares levels | next |
 | Command | Runs a slash command (`/compact`, `/plan`, …) through `commands.execute` | next |
 | Branch | Evaluates a condition and picks a path | yes / no |
 | Loop | Follows "again" until the exit condition holds or the iteration cap is reached | again / exit |
