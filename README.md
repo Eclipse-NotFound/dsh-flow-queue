@@ -81,20 +81,16 @@ The plugin adds same-origin routes under `/flow-queue/api/…`; every one of the
 
 ```sh
 node --check client.js
-node --check host2.js
-node test/offline-check.mjs
+node --check index.js
+node test/offline-check.mjs      # Host module against a mock Cordis context
+node test/client-apply-check.mjs # client activation against a mock loader/context
 ```
 
-The test drives the real Host module against a mock Cordis context — no DSH process, no network. Eight scenarios: boundary guard, branching, loops (including the iteration cap), checkpoint, command step, attachments, package round-trip, and the validation guards.
+The Host check runs eight scenarios: boundary guard, branching, loops (including the iteration cap), checkpoint, command step, attachments, package round-trip, and the validation guards. The client check emulates the browser module loader and confirms `apply` registers the tab type, the tab body and the sidebar entry.
 
-### Hot-swapping the Host half
+### Updating a running install
 
-A running Harness caches an imported module by its resolved URL, so editing `hostN.js` does not take effect on its own. To ship a change without restarting the app:
-
-1. save the new implementation as the next file (`host3.js`) and update both the `index.js` re-export and the row name in `cordis.patch.yml` (`dsh-flow-queue/host3`);
-2. toggle the bundle off and on in the plugin manager (or restart the app).
-
-The client half needs none of this: the page fetches the client bundle again, so a page reload is enough.
+The Host half is loaded once per process, so a Host change needs a bundle toggle in the plugin manager or an app restart. The client half is fetched by the page, so a reload is enough — but keep the bundle row naming the package itself (`name: dsh-flow-queue`): a subpath row gives the client module system a row id the bundle never registers under, and the whole client half silently stays unloaded.
 
 ## Not implemented yet
 

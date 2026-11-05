@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented here.
 
+## 0.2.2 — 2026-11-05
+
+- Fix: the client half did not load at all under 0.2.1. The bundle row named a versioned subpath (`dsh-flow-queue/host2`), which hands the client module system a row id that the client bundle never registers under — so the right-sidebar tab and its sidebar entry never appeared. The row now names the package itself and the Host implementation is back in `index.js`; Host updates apply on a bundle toggle or app restart.
+
 ## 0.2.1 — 2026-11-04
 
 - The editor now lives inside the right-sidebar tab instead of a frame-wide overlay: run controls and a `⋯` menu on top, a palette row, the canvas, and a one-line footer.

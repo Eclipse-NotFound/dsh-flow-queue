@@ -97,20 +97,16 @@ dsh plugin --profile web add github:Eclipse-NotFound/dsh-flow-queue
 
 ```sh
 node --check client.js
-node --check host2.js
-node test/offline-check.mjs   # 8 个场景：边界守卫、分支、循环（含熔断）、断点、命令块、附件、流程包、校验
+node --check index.js
+node test/offline-check.mjs      # 宿主模块 + 模拟 Cordis 上下文
+node test/client-apply-check.mjs # 客户端激活 + 模拟模块加载器/上下文
 ```
 
-测试用模拟的 Cordis 上下文驱动真实宿主模块，不需要 DSH 进程。
+宿主检查跑 8 个场景：边界守卫、分支、循环（含熔断）、断点、命令块、附件、流程包、校验。客户端检查模拟浏览器模块加载器，确认 `apply` 注册了标签类型、标签主体与侧栏入口。
 
-### 宿主代码热更新
+### 更新已安装的插件
 
-运行中的 Harness 按解析后的 URL 缓存已导入的模块，所以改 `hostN.js` 不会自动生效。更新步骤：
-
-1. 改完后另存为下一个版本文件（`host3.js`），同步改 `index.js` 的 re-export 与 `cordis.patch.yml` 的行名（`dsh-flow-queue/host3`）；
-2. 用插件管理器把本 bundle 关一次再开（或重启应用）。
-
-`client.js` 不需要这套：页面侧会重新取客户端包，刷新页面即可。
+宿主半每个进程只加载一次，所以改宿主需要把 bundle 关一次再开（或重启应用）。客户端半由页面重新下载，刷新页面即可——但**行名必须写包名本身**（`name: dsh-flow-queue`）：写成子路径（`dsh-flow-queue/host2`）会给客户端模块系统一个 bundle 从未注册的行 id，整个客户端半会静默地不加载。
 
 ## 尚未实现
 

@@ -3,11 +3,11 @@
 # The Host half owns one flow graph per Session and advances it only at a turn
 # boundary (`turn/end` plus an idle Agent), so a model switch can never land
 # inside an in-flight request or one of its retries. The Client half registers a
-# right-sidebar tab and a frame-wide flow editor.
+# right-sidebar tab with the flow editor.
 #
-# The row targets a versioned `./hostN` subpath rather than a stable entry: a
-# running Harness caches a module by resolved URL, so pointing at a fresh file is
-# how Host updates become live without restarting the app.
+# The row names the package itself. A subpath row (`pkg/host2`) gives the client
+# module system a row id that the bundle never registers under, and the whole
+# client half then stays unloaded.
 - insert:
     - id: flow-queue
-      name: dsh-flow-queue/host2
+      name: dsh-flow-queue

@@ -1640,7 +1640,7 @@ window.__ModuleLoader__.load({
 							id: TAB_ID,
 							kind: TAB_ID,
 							title,
-							guide: [{ order: 30, title, description, icon: Glyph }],
+							guide: [{ order: 15, title, description, icon: Glyph }],
 						}),
 					'dsh-flow-queue: right sidebar tab type',
 				);
@@ -1650,7 +1650,10 @@ window.__ModuleLoader__.load({
 				ctx.slots.register({ name: 'sidebar.right.pane.tab', key: TAB_ID }, FlowQueuePanel));
 
 			ctx.slots.inject('sidebar.footer.action', () =>
-				ctx.slots.register({ name: 'sidebar.footer.action', id: 'flow-queue', order: 20 }, OpenFlowQueueButton));
+				ctx.slots.register(
+					{ name: 'sidebar.footer.action', id: 'flow-queue', order: 20, label: () => ttext('tab.title') },
+					OpenFlowQueueButton,
+				));
 
 			ctx.effect(() => {
 				const style = document.createElement('style');
