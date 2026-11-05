@@ -1576,16 +1576,111 @@ window.__ModuleLoader__.load({
 			);
 		}
 
+		function openFlowQueueTab() {
+			try {
+				const face = pluginCtx === null ? undefined : pluginCtx.get('sidebarRight');
+				if (face !== undefined && typeof face.openTab === 'function') face.openTab(TAB_ID);
+			} catch {
+				/* nothing else can open the tab; the right sidebar guide still lists it */
+			}
+		}
+
+		/**
+		 * The right sidebar's start page lists one card per tab type and clips the
+		 * overflow — with enough plugins installed the last card (the "more tools"
+		 * entry) is unreachable. Walk up from our own card to the container that
+		 * actually clips, and let it scroll. The original inline styles are restored
+		 * when the card unmounts, so this stays a view-level workaround.
+		 */
+		function useGuideScrollFix() {
+			const ref = useRef(null);
+			useEffect(() => {
+				const element = ref.current;
+				if (element === null || element === undefined) return undefined;
+				let patched = null;
+				const apply = () => {
+					let node = element.parentElement;
+					while (node !== null && node !== undefined && node !== document.body) {
+						let overflowY = '';
+						try {
+							overflowY = getComputedStyle(node).overflowY;
+						} catch {
+							overflowY = '';
+						}
+						const clips = overflowY === 'hidden' || overflowY === 'clip';
+						if (clips && node.scrollHeight > node.clientHeight + 4) {
+							if (patched === null || patched.node !== node) {
+								patched = { node, overflowY: node.style.overflowY, minHeight: node.style.minHeight };
+							}
+							node.style.overflowY = 'auto';
+							node.style.minHeight = '0';
+							break;
+						}
+						node = node.parentElement;
+					}
+				};
+				apply();
+				const interval = setInterval(apply, 1000);
+				window.addEventListener('resize', apply);
+				return () => {
+					clearInterval(interval);
+					window.removeEventListener('resize', apply);
+					if (patched !== null) {
+						patched.node.style.overflowY = patched.overflowY;
+						patched.node.style.minHeight = patched.minHeight;
+					}
+				};
+			}, []);
+			return ref;
+		}
+
+		/** Our own card on the right sidebar's start page: closes the clipping loop. */
+		function GuideCard(props) {
+			const ref = useGuideScrollFix();
+			const title = props !== null && props !== undefined && typeof props.title === 'string' && props.title !== ''
+				? props.title
+				: ttext('tab.title');
+			const description = props !== null && props !== undefined && typeof props.description === 'string' ? props.description : '';
+			return h(
+				'button',
+				{
+					ref,
+					type: 'button',
+					onClick: openFlowQueueTab,
+					style: {
+						appearance: 'none',
+						width: '100%',
+						boxSizing: 'border-box',
+						textAlign: 'left',
+						display: 'flex',
+						alignItems: 'center',
+						gap: '14px',
+						padding: '16px 18px',
+						borderRadius: '16px',
+						border: `1px solid ${C.border}`,
+						background: 'transparent',
+						color: C.text,
+						cursor: 'pointer',
+						fontFamily: 'inherit',
+						fontSize: '15px',
+						lineHeight: '22px',
+					},
+				},
+				h('span', { style: { display: 'flex', flex: 'none', color: C.accent } }, h(Glyph, { size: 20 })),
+				h(
+					'span',
+					{ style: { display: 'flex', flexDirection: 'column', gap: '2px', minWidth: 0 } },
+					h('span', null, title),
+					description !== ''
+						? h('span', { style: { fontSize: '12px', lineHeight: '16px', color: C.dim } }, description)
+						: null,
+				),
+			);
+		}
+
 		function OpenFlowQueueButton() {
 			const t = useT();
-			const open = () => {
-				try {
-					const face = pluginCtx === null ? undefined : pluginCtx.get('sidebarRight');
-					if (face !== undefined && typeof face.openTab === 'function') face.openTab(TAB_ID);
-				} catch {
-					/* nothing else can open the tab; the right sidebar guide still lists it */
-				}
-			};
+			const open = openFlowQueueTab;
 			return h(
 				'button',
 				{
@@ -1648,6 +1743,11 @@ window.__ModuleLoader__.load({
 
 			ctx.slots.inject('sidebar.right.pane.tab', () =>
 				ctx.slots.register({ name: 'sidebar.right.pane.tab', key: TAB_ID }, FlowQueuePanel));
+
+			// Our own card on the start page: besides opening the tab it enables
+			// scrolling on the clipping list, so the last entries stay reachable.
+			ctx.slots.inject('sidebar.right.tab.guide.entry', () =>
+				ctx.slots.register({ name: 'sidebar.right.tab.guide.entry', key: TAB_ID }, GuideCard));
 
 			ctx.slots.inject('sidebar.footer.action', () =>
 				ctx.slots.register(

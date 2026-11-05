@@ -108,6 +108,7 @@ assert.equal(calls.tabs.length, 1, 'one tab type');
 assert.equal(calls.tabs[0].id, 'flow-queue');
 assert.equal(calls.tabs[0].guide.length, 1, 'one guide entry');
 assert.ok(calls.slots.some((slot) => slot.options.name === 'sidebar.right.pane.tab' && slot.options.key === 'flow-queue'), 'the tab body is registered');
+assert.ok(calls.slots.some((slot) => slot.options.name === 'sidebar.right.tab.guide.entry' && slot.options.key === 'flow-queue'), 'the guide card is registered');
 assert.ok(calls.slots.some((slot) => slot.options.name === 'sidebar.footer.action' && slot.options.id === 'flow-queue'), 'the sidebar footer action is registered');
 
 console.log('dsh-flow-queue client apply check: passed');

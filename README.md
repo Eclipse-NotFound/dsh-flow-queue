@@ -22,6 +22,8 @@ The plugin registers one right-sidebar tab, and the whole canvas lives inside it
 - **Select a step** — the canvas area becomes that step's inspector (← goes back), with fields for its kind and "run from here" / "delete" in the header.
 - **Packages** — `⋯ → Packages` saves, loads and deletes reusable flows in the same panel.
 
+Two entry points open it: the icon beside Settings at the sidebar foot, and the "Flow queue" card on the right sidebar's start page. That start page lists one card per tab type and clips its overflow instead of scrolling, so with enough plugins installed the last cards become unreachable; the plugin's own card walks up to the container that clips and turns on scrolling while it is mounted (the original inline styles come back when it unmounts).
+
 ## Step types
 
 | Type | What it does | Outputs |

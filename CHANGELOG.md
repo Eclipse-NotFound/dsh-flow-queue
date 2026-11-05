@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here.
 
+## 0.2.3 — 2026-11-05
+
+- The right sidebar's start page clips its card list instead of scrolling, so the last entries (including "more tools") become unreachable once several plugins register tabs. The plugin now renders its own card there and, while that card is mounted, finds the container that actually clips and switches it to scrolling; the original inline styles are restored on unmount.
+- `test/client-apply-check.mjs` also asserts the guide card registration.
+
 ## 0.2.2 — 2026-11-05
 
 - Fix: the client half did not load at all under 0.2.1. The bundle row named a versioned subpath (`dsh-flow-queue/host2`), which hands the client module system a row id that the client bundle never registers under — so the right-sidebar tab and its sidebar entry never appeared. The row now names the package itself and the Host implementation is back in `index.js`; Host updates apply on a bundle toggle or app restart.
