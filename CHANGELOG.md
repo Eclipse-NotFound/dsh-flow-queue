@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here.
 
+## 0.8.0 — 2026-11-07
+
+- **Package variables**: a saved flow may declare vars; `{{name}}` placeholders in prompt / fan-out / send texts (and commands, notes) are filled at load time from one small form. Unfilled placeholders stay visible — never an empty prompt by surprise. Saving keeps declared vars and auto-derives any placeholder still in the texts, so editing a loaded package back into a template just works.
+- **The superagent review loop ships as a builtin package** (`superagent-review`): ticket-first worker dispatch → readiness branch on the four-state marker → independent reviewer → bounded follow-up loop (≤3 rounds) → delivery gate. Two vars (`{{task}}`, `{{ticket}}`); runs in any session with no fleet setup (throwaway subagents, context in the ticket file); an opening checkpoint parks the run so the filled prompts are confirmed before the first subagent is spent.
+- **Subagent briefs keep the tail**: a done lane's summary now carries head *and* tail of the reply, so the four-state marker on the last line survives into the branch-decidable outcome (a head-only slice hid exactly the routable part).
+- **Wait outcomes are routable**: a completed wait sets the flow outcome to the target's latest text (and its result line shows the matched marker line); a timed-out wait sets `ok: false`, so a branch after a wait routes on what the target actually reported instead of a generic note.
+- Fix: a loop that took its `again` port stayed `running` forever when the run later finished through another path; a clean finish now closes it as `completed` with its round label intact.
+- Tests: three new scenarios (superagent package present + `{{var}}` fills with unfilled-placeholder visibility; the loop end to end — ready worker, blocked review, follow-up, pass, delivery gate; a marker wait feeding the branch behind it), 25 in total.
+
 ## 0.7.0 — 2026-11-06
 
 - **Stop fleet**: one button on the fleet header pauses every live run (cancelling in-flight fan-outs and waits) and cancels every pending delivery; idempotent, returns what it stopped.

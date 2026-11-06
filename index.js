@@ -10,7 +10,7 @@
 //   GET  /flow-queue/api/models              routable model catalog
 //   GET  /flow-queue/api/packages            saved flow packages
 //   POST /flow-queue/api/command             graph / run / attachment mutations
-//   POST /flow-queue/api/packages            save / load / delete a package
+//   POST /flow-queue/api/packages            save / load (with {{var}} fills) / delete a package
 
 import { randomUUID } from 'node:crypto';
 import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
@@ -61,6 +61,7 @@ let waitMinTimeoutMs = WAIT_MIN_TIMEOUT_MS;
 const WAIT_MODES = new Set(['idle', 'marker']);
 const DEFAULT_REPORT_MARKER = '[[FLOW:REPORT';
 const MAX_FLEET_IDENT = 120;
+const MAX_PACKAGE_VARS = 12;
 
 const NODE_STATUSES = new Set(['idle', 'running', 'completed', 'failed', 'skipped', 'waiting']);
 const NODE_KINDS = new Set(['prompt', 'model', 'command', 'checkpoint', 'branch', 'loop', 'dispatch', 'send', 'wait']);
@@ -158,6 +159,64 @@ function textOfBlocks(content) {
 		}
 	}
 	return parts.join('\n').trim();
+}
+
+/**
+ * Head+tail brief of a subagent reply. The four-state report marker lives on
+ * the reply's LAST line, so a head-only slice would hide exactly the part
+ * that branch conditions route on.
+ */
+function briefOf(text, head = 260, tail = 340) {
+	if (typeof text !== 'string' || text === '') return '';
+	const budget = head + tail;
+	if (text.length <= budget + 8) return text.slice(0, budget + 8);
+	return `${text.slice(0, head)}\n…\n${text.slice(-tail)}`;
+}
+
+function normalizePackageVars(input) {
+	if (!Array.isArray(input)) return [];
+	const seen = new Set();
+	const list = [];
+	for (const item of input) {
+		if (item === null || typeof item !== 'object') continue;
+		const name = typeof item.name === 'string' ? item.name.trim() : '';
+		if (!/^[A-Za-z0-9_-]{1,40}$/.test(name) || seen.has(name)) continue;
+		seen.add(name);
+		list.push({
+			name,
+			label: typeof item.label === 'string' ? item.label.slice(0, 60) : '',
+			value: typeof item.value === 'string' ? item.value.slice(0, 500) : '',
+		});
+		if (list.length >= MAX_PACKAGE_VARS) break;
+	}
+	return list;
+}
+
+/** Placeholders a flow's texts still carry: saving keeps them askable. */
+function deriveVars(nodes) {
+	const found = new Set();
+	for (const node of Array.isArray(nodes) ? nodes : []) {
+		if (node === null || typeof node !== 'object') continue;
+		const text = typeof node.text === 'string' ? node.text
+			: typeof node.command === 'string' ? node.command
+			: typeof node.note === 'string' ? node.note
+			: '';
+		for (const match of text.matchAll(/\{\{\s*([A-Za-z0-9_-]{1,40})\s*\}\}/g)) found.add(match[1]);
+	}
+	return [...found].slice(0, MAX_PACKAGE_VARS).map((name) => ({ name, label: '', value: '' }));
+}
+
+/**
+ * Replace {{name}} placeholders with the values the loader supplied. An
+ * unfilled placeholder stays visible in the step instead of silently
+ * becoming empty text.
+ */
+function substituteVars(text, values) {
+	if (typeof text !== 'string' || text === '') return text;
+	return text.replace(/\{\{\s*([A-Za-z0-9_-]{1,40})\s*\}\}/g, (whole, name) => {
+		const hit = values.get(name);
+		return hit === undefined || hit === '' ? whole : hit;
+	});
 }
 
 function conditionOf(input) {
@@ -1219,7 +1278,7 @@ export function apply(ctx, config = {}) {
 				activation.result
 					.then((result) => {
 						const output = result === undefined || result === null ? '' : textOfBlocks(result.output);
-						settle(index, 'done', output.slice(0, 600));
+						settle(index, 'done', briefOf(output));
 					})
 					.catch((error) => {
 						settle(index, 'failed', error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300));
@@ -1277,6 +1336,8 @@ export function apply(ctx, config = {}) {
 			waitRegistry.delete(node.id);
 			touchNode(node, 'failed');
 			node.error = fail('wait-timeout', `the target did not satisfy "${node.until}" within the timeout`);
+			// A timed-out wait is a routable outcome too (branch 'last-failed').
+			graph.outcome = { kind: 'wait', text: '', ok: false, toolErrors: [] };
 			if (graph.run.waitingNode === node.id) graph.run.waitingNode = null;
 			const next = followEdge(graph, node.id, 'next');
 			if (next === undefined) finishRun(graph, 'error', 'wait-timeout');
@@ -1310,8 +1371,18 @@ export function apply(ctx, config = {}) {
 			if (!satisfied) continue;
 			waitRegistry.delete(nodeId);
 			clearWaitWatchdog(nodeId);
+			const lastText = typeof seen.lastText === 'string' ? seen.lastText : '';
+			const markerLine = entry.mode === 'marker'
+				? (lastText.split('\n').find((line) => line.includes(entry.marker)) ?? '').trim().slice(0, 200)
+				: '';
 			touchNode(node, 'completed');
-			node.result = entry.mode === 'marker' ? `收到标记 ${entry.marker}` : '目标已空闲';
+			node.result = entry.mode === 'marker'
+				? (markerLine !== '' ? markerLine : `收到标记 ${entry.marker}`)
+				: '目标已空闲';
+			// The wait outcome feeds branch conditions: a marker wait exposes
+			// the target's latest text so the graph can route on the reported
+			// state instead of guessing from a generic "marker seen" note.
+			graph.outcome = { kind: 'wait', text: lastText.slice(-2000), ok: true, toolErrors: [] };
 			graph.run.waitingNode = null;
 			const next = followEdge(graph, node.id, 'next');
 			if (next === undefined) finishRun(graph, 'done', 'no outgoing connection');
@@ -1345,6 +1416,15 @@ export function apply(ctx, config = {}) {
 		graph.run.waitingJudge = null;
 		graph.run.cursor = null;
 		graph.run.endedAt = Date.now();
+		// A loop that took its 'again' port stays 'running' while the round it
+		// armed is in flight; when the run then finishes through another path
+		// (e.g. the review gate passing), that stale status would read as if
+		// work were still live. Close it honestly on a clean finish.
+		if (state === 'done') {
+			for (const node of graph.nodes) {
+				if (node.kind === 'loop' && node.status === 'running') touchNode(node, 'completed');
+			}
+		}
 	}
 
 	function modelPartsOf(node) {
@@ -1841,6 +1921,7 @@ export function apply(ctx, config = {}) {
 					createdAt: Number.isFinite(parsed.createdAt) ? parsed.createdAt : 0,
 					nodes: Array.isArray(parsed.nodes) ? parsed.nodes.length : 0,
 					edges: Array.isArray(parsed.edges) ? parsed.edges.length : 0,
+					vars: normalizePackageVars(parsed.vars),
 				});
 			} catch {
 				/* skip an unreadable package */
@@ -1853,6 +1934,14 @@ export function apply(ctx, config = {}) {
 		const graph = await ensureGraph(sessionId);
 		const name = singleLine(payload.name) || '未命名流程';
 		const description = typeof payload.description === 'string' ? payload.description.slice(0, 500) : '';
+		// Declared vars win; placeholders still present in the texts join them,
+		// so "edit a loaded package, retype some parts as {{placeholders}}, save"
+		// keeps the package re-askable without a separate editor.
+		const byName = new Map(normalizePackageVars(payload.vars).map((item) => [item.name, item]));
+		for (const item of deriveVars(graph.nodes)) {
+			if (!byName.has(item.name)) byName.set(item.name, item);
+		}
+		const vars = [...byName.values()].slice(0, MAX_PACKAGE_VARS);
 		const id = `pkg_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
 		const body = {
 			version: STORE_VERSION,
@@ -1860,6 +1949,7 @@ export function apply(ctx, config = {}) {
 			name,
 			description,
 			createdAt: Date.now(),
+			vars,
 			nodes: graph.nodes.map((node) => {
 				const copy = { ...node };
 				delete copy.status;
@@ -1881,8 +1971,9 @@ export function apply(ctx, config = {}) {
 		return { id, name };
 	}
 
-	async function loadPackage(sessionId, id) {
-		const safe = typeof id === 'string' ? id.replace(/[^A-Za-z0-9_-]/g, '') : '';
+	async function loadPackage(sessionId, payload) {
+		const source = payload !== null && typeof payload === 'object' ? payload : {};
+		const safe = typeof source.id === 'string' ? source.id.replace(/[^A-Za-z0-9_-]/g, '') : '';
 		if (safe === '') throw fail('invalid-package', 'a package id is required');
 		let parsed;
 		try {
@@ -1890,11 +1981,29 @@ export function apply(ctx, config = {}) {
 		} catch {
 			throw fail('invalid-package', 'no such package');
 		}
+		// Loader-supplied fills for {{placeholders}}. Unfilled ones stay
+		// visible in the loaded steps — never an empty prompt by surprise.
+		const values = new Map();
+		if (source.vars !== null && typeof source.vars === 'object' && !Array.isArray(source.vars)) {
+			for (const [key, val] of Object.entries(source.vars)) {
+				if (/^[A-Za-z0-9_-]{1,40}$/.test(key) && typeof val === 'string' && val !== '') {
+					values.set(key, val.slice(0, 4000));
+				}
+			}
+		}
+		const nodes = (Array.isArray(parsed.nodes) ? parsed.nodes : []).map((node) => {
+			if (node === null || typeof node !== 'object') return node;
+			const copy = { ...node };
+			if (typeof copy.text === 'string') copy.text = substituteVars(copy.text, values);
+			if (typeof copy.command === 'string') copy.command = substituteVars(copy.command, values);
+			if (typeof copy.note === 'string') copy.note = substituteVars(copy.note, values);
+			return copy;
+		});
 		const graph = await ensureGraph(sessionId);
 		if (graph.run.state === 'running' || graph.run.state === 'waiting') {
 			throw fail('run-active', 'pause or reset the run before loading a package');
 		}
-		const loaded = normalizeStored({ version: STORE_VERSION, nodes: parsed.nodes, edges: parsed.edges, entry: parsed.entry }, sessionId);
+		const loaded = normalizeStored({ version: STORE_VERSION, nodes, edges: parsed.edges, entry: parsed.entry }, sessionId);
 		graph.nodes = loaded.nodes;
 		graph.edges = loaded.edges;
 		graph.entry = loaded.entry;
@@ -2406,7 +2515,7 @@ export function apply(ctx, config = {}) {
 					try {
 						const sessionId = requireSessionId(payload === null || payload === undefined ? undefined : payload.sessionId);
 						if (payload.op === 'save') return writeJson(res, 200, { ok: true, value: await savePackage(sessionId, payload) });
-						if (payload.op === 'load') return writeJson(res, 200, { ok: true, value: await loadPackage(sessionId, payload.id) });
+						if (payload.op === 'load') return writeJson(res, 200, { ok: true, value: await loadPackage(sessionId, payload) });
 						if (payload.op === 'delete') return writeJson(res, 200, { ok: true, value: await deletePackage(payload.id) });
 						return writeJson(res, 400, { ok: false, error: fail('invalid-command', 'unknown op') });
 					} catch (error) {
@@ -2639,6 +2748,11 @@ export function apply(ctx, config = {}) {
 	// a worker-prompt template that pins the four-state turn-end marker, and
 	// the matching marker wait. Written once ('wx'), never overwritten — an
 	// edited copy stays edited.
+	//
+	// The superagent review loop ships the same way: the whole lifecycle the
+	// M4 pilot ran live (ticket-first dispatch -> four-state worker report ->
+	// readiness branch -> independent reviewer -> bounded follow-up loop ->
+	// delivery gate) as one loadable graph with {{task}}/{{ticket}} fills.
 	void (async () => {
 		try {
 			await mkdir(packageDir, { recursive: true });
@@ -2664,6 +2778,157 @@ export function apply(ctx, config = {}) {
 				edges: [{ id: newId('e'), from: promptId, port: 'next', to: waitId }],
 			};
 			await writeFile(path.join(packageDir, 'report-protocol.json'), JSON.stringify(body, null, '\t'), { encoding: 'utf8', flag: 'wx' });
+
+			const READY = '\\[\\[FLOW:REPORT ready\\]\\]';
+			const workerText = [
+				'【角色】worker（执行者），本工单由流程队列 superagent 方案包派发。',
+				'【任务】{{task}}',
+				'【工单】开工先把任务原文与计划写入运行工单文件 {{ticket}}；此后每次状态变更先改工单再动作（先存后发）。',
+				'【纪律】',
+				'1. 动手前先核对现状（读工单/仓库），不凭假设；改文件前先认领（claim），完成即释放。',
+				'2. 每轮把报告追加进工单文件；回复最后一行必须是且只能是一行报告标记：',
+				'[[FLOW:REPORT waiting]] 进行中',
+				'[[FLOW:REPORT ready]] 已完成待审阅',
+				'[[FLOW:REPORT blocked]] 被阻塞，说明需要谁做什么来解除',
+				'[[FLOW:REPORT failed]] 失败，说明原因',
+				'标记后跟一句中文摘要。',
+				'3. 范围外发现只在工单记一行，不展开、不动手。',
+			].join('\n');
+			const reviewerText = [
+				'【角色】reviewer（独立评审）：与 worker 无上下文共享，不采信自述。',
+				'【评审对象】{{task}}',
+				'【输入】工单 {{ticket}}（worker 自述与历轮报告）＋ 仓库实际改动（git diff / 文件现状）。',
+				'【做法】逐项对源码核验工单声称完成的每一条；范围外发现只记录不修复。',
+				'【输出】评审报告追加进工单；结论两档，回复最后一行输出对应标记：',
+				'[[FLOW:REPORT ready]] 通过，可交付（附逐项核验清单）',
+				'[[FLOW:REPORT blocked]] 不通过（逐条列出必须修复项）',
+				'标记后跟一句中文摘要。',
+			].join('\n');
+			const followupText = [
+				'【角色】worker（跟进轮）。上一轮评审未通过，评审报告已追加在工单 {{ticket}}。',
+				'【任务】只做评审“必须修复”清单内的事：先读工单与评审报告核对现状，已完成项不重做，逐项修复并更新工单。',
+				'【纪律】同首轮（先存后发、认领文件、范围外只记录）。结束时最后一行仍输出 [[FLOW:REPORT ready|blocked|failed]] 标记＋一句摘要。',
+			].join('\n');
+			const superagent = {
+				version: STORE_VERSION,
+				id: 'superagent-review',
+				name: 'superagent 评审循环（派工→评审→回环→交付门）',
+				description: 'Router 会话开箱可跑的 superagent 1:1 编排：dispatch 派工 worker（工单先存后发＋四态报告）→ 分支验 ready → 独立评审 reviewer → 不通过进跟进回环（≤3 轮）→ 通过才到交付门。全程只在本会话的回合边界运行，无需编制其他会话；载入时填 {{task}}（任务）与 {{ticket}}（工单路径）。',
+				createdAt: 0,
+				vars: [
+					{ name: 'task', label: '任务描述（派给 worker 的目标）', value: '' },
+					{ name: 'ticket', label: '运行工单文件路径（先存后发）', value: '' },
+				],
+				entry: 'sa_brief',
+				nodes: [
+					{
+						id: 'sa_brief',
+						kind: 'checkpoint',
+						x: 40,
+						y: 40,
+						title: '说明',
+						note: 'superagent 评审循环：派工 → worker 四态报告 → 就绪则独立评审 → 不通过走跟进回环（≤3 轮）→ 通过才到交付门。任务={{task}} 工单={{ticket}}（载入方案包时填参数）。',
+					},
+					{
+						id: 'sa_worker',
+						kind: 'dispatch',
+						x: 260,
+						y: 40,
+						title: '派工 · worker',
+						text: workerText,
+						targets: [{ label: 'W', provider: '', model: '', reasoningEffort: '' }],
+						collect: 'all',
+						k: 1,
+						timeoutMs: 900000,
+					},
+					{
+						id: 'sa_w_ok',
+						kind: 'branch',
+						x: 500,
+						y: 40,
+						title: 'worker 就绪？',
+						condition: { type: 'regex', value: READY },
+					},
+					{
+						id: 'sa_review',
+						kind: 'dispatch',
+						x: 740,
+						y: 40,
+						title: '评审 · reviewer（独立）',
+						text: reviewerText,
+						targets: [{ label: 'R', provider: '', model: '', reasoningEffort: '' }],
+						collect: 'all',
+						k: 1,
+						timeoutMs: 600000,
+					},
+					{
+						id: 'sa_r_ok',
+						kind: 'branch',
+						x: 980,
+						y: 40,
+						title: '评审通过？',
+						condition: { type: 'regex', value: READY },
+					},
+					{
+						id: 'sa_deliver',
+						kind: 'prompt',
+						x: 1220,
+						y: 40,
+						title: '交付门',
+						text: '【交付门】独立评审通过。任务：{{task}}；工单：{{ticket}}。\nRouter 复核工单与评审记录 → 合并并推送（commit/push 由 Router 把关）→ 工单状态改为已交付。',
+					},
+					{
+						id: 'sa_round',
+						kind: 'loop',
+						x: 980,
+						y: 240,
+						title: '跟进回环（≤3 轮）',
+						condition: { type: 'marker', value: '[[FLOW:REPORT blocked]]', negate: true },
+						maxIterations: 3,
+					},
+					{
+						id: 'sa_followup',
+						kind: 'dispatch',
+						x: 740,
+						y: 240,
+						title: '跟进 · worker（读工单续命）',
+						text: followupText,
+						targets: [{ label: 'W', provider: '', model: '', reasoningEffort: '' }],
+						collect: 'all',
+						k: 1,
+						timeoutMs: 900000,
+					},
+					{
+						id: 'sa_escalate',
+						kind: 'prompt',
+						x: 500,
+						y: 240,
+						title: 'Router 介入（worker 未就绪）',
+						text: '【Router 人工介入】worker 未报告 ready（末行标记为 blocked/failed，或整体失败/超时）。\n任务：{{task}}；工单：{{ticket}}。读工单后裁决：改写派工重跑 / 拆小任务 / 人工接手。本轮回到此终止。',
+					},
+					{
+						id: 'sa_stuck',
+						kind: 'prompt',
+						x: 980,
+						y: 440,
+						title: 'Router 介入（评审回环耗尽）',
+						text: '【Router 人工介入】评审多轮未通过（已达回环上限）。工单：{{ticket}}。\n读历次评审报告，裁决：换任务拆法 / 换模型与角色 / 终止本任务。自动回环到此停止。',
+					},
+				],
+				edges: [
+					{ id: 'e_sa_1', from: 'sa_brief', port: 'next', to: 'sa_worker' },
+					{ id: 'e_sa_2', from: 'sa_worker', port: 'next', to: 'sa_w_ok' },
+					{ id: 'e_sa_3', from: 'sa_w_ok', port: 'yes', to: 'sa_review' },
+					{ id: 'e_sa_4', from: 'sa_w_ok', port: 'no', to: 'sa_escalate' },
+					{ id: 'e_sa_5', from: 'sa_review', port: 'next', to: 'sa_r_ok' },
+					{ id: 'e_sa_6', from: 'sa_r_ok', port: 'yes', to: 'sa_deliver' },
+					{ id: 'e_sa_7', from: 'sa_r_ok', port: 'no', to: 'sa_round' },
+					{ id: 'e_sa_8', from: 'sa_round', port: 'again', to: 'sa_followup' },
+					{ id: 'e_sa_9', from: 'sa_round', port: 'exit', to: 'sa_stuck' },
+					{ id: 'e_sa_10', from: 'sa_followup', port: 'next', to: 'sa_w_ok' },
+				],
+			};
+			await writeFile(path.join(packageDir, 'superagent-review.json'), JSON.stringify(superagent, null, '\t'), { encoding: 'utf8', flag: 'wx' });
 		} catch {
 			/* already present, or the package dir is read-only: either way the
 			   library simply lists what is on disk */

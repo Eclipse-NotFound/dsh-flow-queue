@@ -136,6 +136,13 @@ A condition is evaluated against the **most recent outcome** (for a prompt step:
 
 `⋯ → Packages` stores the current graph under `$DSH_PROFILE_DIR/flow-queue/packages/*.json` (nodes and edges only, no run state) and loads or deletes them from any session.
 
+A package may declare **variables**: write `{{task}}` in a prompt / fan-out / send text (or a command or note), and loading the package asks for one fill per name (`{{task}}` → your text) before the graph lands. Unfilled placeholders stay visible in the loaded steps — never an empty prompt by surprise. Saving keeps declared vars and auto-derives any `{{placeholder}}` still present in the texts, so "load, retype some parts as placeholders, save" yields a reusable template.
+
+Two packages ship built in (written once, never overwritten — an edited copy stays edited):
+
+- `report-protocol` — the four-state turn-end marker (`[[FLOW:REPORT waiting|ready|blocked|failed]]`) as a worker-prompt template plus the matching marker wait.
+- `superagent-review` — the whole superagent lifecycle as one runnable graph: ticket-first worker dispatch → readiness branch on the four-state marker → an independent reviewer → a bounded follow-up loop (≤3 rounds) → a delivery gate that hands the push back to this session. Two vars to fill on load: `{{task}}` and `{{ticket}}`. It runs in any session with no fleet setup: workers and reviewers are throwaway subagents whose context lives in the ticket file, and the opening checkpoint parks the run so you confirm the filled prompts before a single subagent is spent.
+
 ## Install
 
 ```sh
@@ -155,7 +162,7 @@ node test/offline-check.mjs      # Host module against a mock Cordis context
 node test/client-apply-check.mjs # client activation against a mock loader/context
 ```
 
-The Host check runs twenty-two scenarios: boundary guard, branching, loops (including the iteration cap), checkpoint, command step, attachments, package round-trip, validation guards, mention catalogs and inline command lines, the natural-language judge, fan-out aggregation with a failing lane, early k-of-n collection, fan-out timeout, stop-cancels-fan-out, loop re-fan-out, outbox delivery with fleet CRUD, backoff/dead-letter/revive ordering, wait-idle, wait-marker, the hop cap with the change-attribution block, fleet.stop idempotence, and the shipped report-protocol package. The client check emulates the browser module loader and confirms `apply` registers the tab type, the tab body and the sidebar entry.
+The Host check runs twenty-five scenarios: boundary guard, branching, loops (including the iteration cap), checkpoint, command step, attachments, package round-trip, validation guards, mention catalogs and inline command lines, the natural-language judge, fan-out aggregation with a failing lane, early k-of-n collection, fan-out timeout, stop-cancels-fan-out, loop re-fan-out, outbox delivery with fleet CRUD, backoff/dead-letter/revive ordering, wait-idle, wait-marker, the hop cap with the change-attribution block, fleet.stop idempotence, the shipped report-protocol package, the superagent package with `{{var}}` fills, the superagent loop end to end (ready → blocked review → follow-up → pass), and a marker wait feeding the branch that follows it. The client check emulates the browser module loader and confirms `apply` registers the tab type, the tab body and the sidebar entry.
 
 ### Updating a running install
 
@@ -163,10 +170,10 @@ The Host half is loaded once per process, so a Host change needs a bundle toggle
 
 ## Not implemented yet
 
-- package variables (`{{var}}` placeholders filled at load time);
 - attachment thumbnails, drag reordering, marquee selection, undo/redo;
 - fan-out lanes beyond 8 per step, and cross-step sharing of one fan-out's results;
-- canvas and inspector side by side (in a narrow column they take turns; ← returns to the canvas).
+- canvas and inspector side by side (in a narrow column they take turns; ← returns to the canvas);
+- warm reuse of a dispatched worker (a follow-up round spawns a fresh subagent that rebuilds context from the ticket file; sending back into the original child session needs verified delivery).
 
 ## License
 

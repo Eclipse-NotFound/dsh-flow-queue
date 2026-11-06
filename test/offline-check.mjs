@@ -1071,4 +1071,150 @@ async function cleanup(harness) {
 
 //#endregion
 
+//#region scenario 23: the superagent package ships, loads, and takes {{var}} fills
+
+{
+	const h = await makeHarness();
+	let entry;
+	for (let attempt = 0; attempt < 100 && entry === undefined; attempt += 1) {
+		const listed = await h.call(ROUTES.packages);
+		assert.equal(listed.status, 200);
+		entry = listed.json.value.find((item) => item.id === 'superagent-review');
+		if (entry === undefined) await sleep(30);
+	}
+	assert.ok(entry, 'the superagent review package is present');
+	assert.equal(entry.nodes, 10);
+	assert.equal(entry.edges, 10);
+	assert.deepEqual(entry.vars.map((item) => item.name), ['task', 'ticket']);
+
+	// Load without fills: placeholders stay visible, never silently empty.
+	const bare = await h.call(ROUTES.packages, { method: 'POST', body: { op: 'load', sessionId: SESSION, id: 'superagent-review' } });
+	assert.equal(bare.status, 200, `bare load failed: ${JSON.stringify(bare.json && bare.json.error)}`);
+	const bareWorker = bare.json.value.nodes.find((node) => node.id === 'sa_worker');
+	assert.ok(bareWorker.text.includes('{{task}}'), 'an unfilled placeholder stays visible');
+
+	// Load with fills: texts substituted, structural props untouched.
+	const filled = await h.call(ROUTES.packages, {
+		method: 'POST',
+		body: {
+			op: 'load',
+			sessionId: SESSION,
+			id: 'superagent-review',
+			vars: { task: '给 README 补安装一节', ticket: 'D:/tmp/tickets/T9-运行.md' },
+		},
+	});
+	assert.equal(filled.status, 200, `filled load failed: ${JSON.stringify(filled.json && filled.json.error)}`);
+	const graph = filled.json.value;
+	const worker = graph.nodes.find((node) => node.id === 'sa_worker');
+	assert.ok(worker.text.includes('给 README 补安装一节'));
+	assert.ok(worker.text.includes('D:/tmp/tickets/T9-运行.md'));
+	assert.ok(!worker.text.includes('{{task}}'), 'filled placeholders are gone');
+	const gate = graph.nodes.find((node) => node.id === 'sa_w_ok');
+	assert.equal(gate.condition.type, 'regex');
+	assert.equal(gate.condition.value, '\\[\\[FLOW:REPORT ready\\]\\]');
+	const loopBack = graph.edges.find((edge) => edge.from === 'sa_followup' && edge.port === 'next');
+	assert.equal(loopBack.to, 'sa_w_ok', 'the follow-up round re-enters the readiness gate');
+
+	await cleanup(h);
+}
+
+//#endregion
+
+//#region scenario 24: the superagent loop runs end to end (ready → blocked review → follow-up → pass)
+
+{
+	const h = await makeHarness();
+	// Worker replies carry a long head so only the tail brief keeps the marker.
+	h.world.children['child-1'] = { delay: 5, output: `${'背景与实现说明。'.repeat(30)}\n全部改动已提交。\n[[FLOW:REPORT ready]] 已完成待审阅` };
+	h.world.children['child-2'] = { delay: 5, output: '逐项核验：两处未过。\n[[FLOW:REPORT blocked]] 需修复安装命令与徽章链接' };
+	h.world.children['child-3'] = { delay: 5, output: '两处已修复并复跑。\n[[FLOW:REPORT ready]] 待复审' };
+	h.world.children['child-4'] = { delay: 5, output: '复审全部通过。\n[[FLOW:REPORT ready]] 可交付' };
+
+	// The builtin ships from an async ensure: wait for it like the panel does.
+	for (let attempt = 0; attempt < 100; attempt += 1) {
+		const listed = await h.call(ROUTES.packages);
+		if (listed.json.value.some((item) => item.id === 'superagent-review')) break;
+		await sleep(30);
+	}
+	const loaded = await h.call(ROUTES.packages, {
+		method: 'POST',
+		body: { op: 'load', sessionId: SESSION, id: 'superagent-review', vars: { task: '补 README 安装节', ticket: 'D:/tmp/tickets/T10.md' } },
+	});
+	assert.equal(loaded.status, 200);
+
+	await h.command({ op: 'run.start' });
+	// The briefing checkpoint parks the run: dispatch costs nothing until the
+	// Router-side confirmation.
+	let parked = await waitForState(h, (value) => value.run.state === 'waiting', 'the run to park at the briefing');
+	assert.equal(parked.run.waitingNode, 'sa_brief');
+	await h.command({ op: 'run.resume' });
+
+	await waitFor(() => h.world.calls.startActivation.length >= 1, 'the worker dispatch');
+	const workerPrompt = h.world.calls.startActivation[0].request.prompt[0].text;
+	assert.ok(workerPrompt.includes('补 README 安装节') && workerPrompt.includes('D:/tmp/tickets/T10.md'), 'the dispatched prompt carries the filled ticket');
+	await waitFor(() => h.world.calls.startActivation.length >= 2, 'the reviewer dispatch after a ready worker');
+	await waitFor(() => h.world.calls.startActivation.length >= 3, 'the follow-up dispatch after a blocked review');
+	await waitFor(() => h.world.calls.startActivation.length >= 4, 'the second review round');
+
+	// The delivery-gate prompt lands in the Router session itself.
+	await waitFor(() => h.world.calls.prompt.some((request) => request.sessionId === SESSION && request.content[0].text.includes('交付门')), 'the delivery gate');
+	h.turnStart(1);
+	h.assistant(1, '已复核并推送。');
+	h.turnEnd(1);
+
+	const done = await waitForState(h, (value) => value.run.state === 'done', 'the superagent loop to finish');
+	const byId = new Map(done.nodes.map((node) => [node.id, node]));
+	if (process.env.FLOW_QUEUE_DEBUG) {
+		console.log('DEBUG run', done.run.state, done.run.message, 'activations', h.world.calls.startActivation.length);
+		for (const node of done.nodes) console.log('DEBUG', node.id, node.kind, node.status, JSON.stringify((node.result ?? '').slice(0, 80)));
+	}
+	assert.equal(byId.get('sa_worker').status, 'completed');
+	assert.equal(byId.get('sa_w_ok').status, 'completed');
+	assert.equal(byId.get('sa_w_ok').title, '条件成立', 'the tail brief kept the marker routable');
+	assert.equal(byId.get('sa_round').status, 'completed');
+	assert.equal(byId.get('sa_deliver').status, 'completed');
+	const followup = byId.get('sa_followup');
+	assert.equal(followup.status, 'completed');
+	assert.ok((followup.children ?? []).length > 0, 'the follow-up round recorded its child');
+
+	await cleanup(h);
+}
+
+//#endregion
+
+//#region scenario 25: a marker wait feeds the branch that follows it
+
+{
+	const h = await makeHarness();
+	const added = await fleetOp(h, { op: 'session.add', targetSessionId: 'T7', alias: 'worker' });
+	const wait = await h.command({ op: 'node.add', kind: 'wait', targetRef: added.session.nodeId, until: 'marker', marker: '[[FLOW:REPORT' });
+	const gate = await h.command({ op: 'node.add', kind: 'branch', condition: { type: 'regex', value: '\\[\\[FLOW:REPORT ready\\]\\]' } });
+	const relax = await h.command({ op: 'node.add', kind: 'prompt', text: '可以交付' });
+	const intervene = await h.command({ op: 'node.add', kind: 'prompt', text: '人工介入' });
+	await h.command({ op: 'edge.add', from: wait.node.id, port: 'next', to: gate.node.id });
+	await h.command({ op: 'edge.add', from: gate.node.id, port: 'yes', to: relax.node.id });
+	await h.command({ op: 'edge.add', from: gate.node.id, port: 'no', to: intervene.node.id });
+
+	await h.command({ op: 'run.start' });
+	targetEvent(h, 'T7', {
+		type: 'assistant/message', seq: 2, time: Date.now(),
+		data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '卡在凭据上。\n[[FLOW:REPORT blocked]] 需要 token' }], source: { kind: 'model', provider: 'p', model: 'm' }, stream: [] } },
+	});
+	targetEvent(h, 'T7', { type: 'turn/end', seq: 3, time: Date.now(), data: { turn: 1, reason: { kind: 'completed' } } });
+
+	await waitFor(() => h.world.calls.prompt.some((request) => request.sessionId === SESSION && request.content[0].text === '人工介入'), 'the blocked report to route to intervention');
+	const snapshot = await h.state();
+	const waitView = snapshot.nodes.find((node) => node.id === wait.node.id);
+	assert.equal(waitView.status, 'completed');
+	assert.equal(waitView.result, '[[FLOW:REPORT blocked]] 需要 token', 'the wait result carries the matched marker line');
+	h.turnStart(1);
+	h.assistant(1, '已介入。');
+	h.turnEnd(1);
+	await waitForState(h, (value) => value.run.state === 'done', 'the gated flow to finish');
+
+	await cleanup(h);
+}
+
+//#endregion
+
 console.log('dsh-flow-queue offline check: all scenarios passed');

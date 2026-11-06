@@ -21,7 +21,7 @@ window.__ModuleLoader__.load({
 		const PORT_GAP = 22;
 		// Keep in sync with package.json. Shown in the panel footer so the page's
 		// running build is identifiable at a glance during remote diagnosis.
-		const CLIENT_VERSION = '0.7.0';
+		const CLIENT_VERSION = '0.8.0';
 
 		let localeSvc = null;
 		let pluginCtx = null;
@@ -186,6 +186,9 @@ window.__ModuleLoader__.load({
 				'library.load': '载入',
 				'library.delete': '删除',
 				'library.saved': '已保存',
+				'library.vars': '参数（每行 name=默认值；提示词里写 {{name}}，载入时填写替换）',
+				'library.fill': '载入前先填参数：',
+				'library.varsCount': '参数',
 				'empty.title': '还没有步骤',
 				'empty.hint': '打开编辑器，把提示词、切模型、命令、分支与循环画成一条流程。',
 				'error.state': '读取流程失败',
@@ -367,6 +370,9 @@ window.__ModuleLoader__.load({
 				'library.load': 'Load',
 				'library.delete': 'Delete',
 				'library.saved': 'Saved',
+				'library.vars': 'Vars (one per line: name=default; write {{name}} in prompts, fill on load)',
+				'library.fill': 'Fill the vars before loading:',
+				'library.varsCount': 'vars',
 				'empty.title': 'No steps yet',
 				'empty.hint': 'Open the editor and draw prompts, model switches, commands, branches and loops into one flow.',
 				'error.state': 'Could not read the flow',
@@ -1937,32 +1943,69 @@ window.__ModuleLoader__.load({
 			const t = props.t;
 			const [name, setName] = useState('');
 			const [description, setDescription] = useState('');
+			const [varsText, setVarsText] = useState('');
+			const [fills, setFills] = useState({});
+			const parseVarsText = (text) => text
+				.split('\n')
+				.map((line) => line.trim())
+				.filter((line) => line !== '' && !line.startsWith('#'))
+				.map((line) => {
+					const at = line.indexOf('=');
+					if (at <= 0) return undefined;
+					return { name: line.slice(0, at).trim(), label: '', value: line.slice(at + 1).trim() };
+				})
+				.filter((item) => item !== undefined && /^[A-Za-z0-9_-]{1,40}$/.test(item.name));
 			return h(
 				'div',
 				{ style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
 				h('input', { value: name, placeholder: t('library.name'), style: inputStyle, onChange: (event) => setName(event.target.value) }),
 				h('input', { value: description, placeholder: t('library.description'), style: inputStyle, onChange: (event) => setDescription(event.target.value) }),
+				h('textarea', {
+					value: varsText,
+					placeholder: t('library.vars'),
+					style: { ...inputStyle, height: '44px', resize: 'vertical' },
+					onChange: (event) => setVarsText(event.target.value),
+				}),
 				h(Button, {
 					disabled: props.busy,
 					onClick: () => {
-						props.onSave(name, description);
+						props.onSave(name, description, parseVarsText(varsText));
 						setName('');
 						setDescription('');
+						setVarsText('');
 					},
 				}, t('library.save')),
 				props.packages.length === 0
 					? h('div', { style: { fontSize: '11px', color: C.dimmer } }, t('library.empty'))
-					: props.packages.map((item) =>
-						h(
+					: props.packages.map((item) => {
+						const vars = Array.isArray(item.vars) ? item.vars : [];
+						return h(
 							'div',
 							{ key: item.id, style: { border: `1px solid ${C.border}`, borderRadius: '7px', padding: '6px 7px', display: 'flex', flexDirection: 'column', gap: '4px' } },
 							h('div', { style: { fontSize: '12px', color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, item.name),
 							item.description !== '' ? h('div', { style: { fontSize: '10px', color: C.dimmer, lineHeight: '14px' } }, item.description) : null,
-							h('div', { style: { fontSize: '10px', color: C.dimmer } }, `${item.nodes} 步 · ${item.edges} 连线`),
+							h('div', { style: { fontSize: '10px', color: C.dimmer } }, `${item.nodes} 步 · ${item.edges} 连线${vars.length > 0 ? ` · ${vars.length} ${t('library.varsCount')}` : ''}`),
+							vars.length > 0 ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: '3px' } },
+								h('div', { style: { fontSize: '10px', color: C.dimmer } }, t('library.fill')),
+								vars.map((entry) => h('input', {
+									key: `${item.id}:${entry.name}`,
+									value: fills[`${item.id}:${entry.name}`] ?? entry.value ?? '',
+									placeholder: entry.label !== '' ? `${entry.label}（{{${entry.name}}}）` : `{{${entry.name}}}`,
+									style: inputStyle,
+									onChange: (event) => setFills((prev) => ({ ...prev, [`${item.id}:${entry.name}`]: event.target.value })),
+								}))) : null,
 							h('div', { style: { display: 'flex', gap: '6px' } },
-								h(Button, { compact: true, disabled: props.busy, onClick: () => props.onLoad(item.id) }, t('library.load')),
+								h(Button, { compact: true, disabled: props.busy, onClick: () => {
+									const values = {};
+									for (const entry of vars) {
+										const filled = fills[`${item.id}:${entry.name}`] ?? entry.value ?? '';
+										if (filled !== '') values[entry.name] = filled;
+									}
+									props.onLoad(item.id, values);
+								} }, t('library.load')),
 								h(Button, { compact: true, danger: true, disabled: props.busy, onClick: () => props.onDelete(item.id) }, t('library.delete'))),
-						)),
+						);
+					}),
 			);
 		}
 
@@ -2583,13 +2626,13 @@ window.__ModuleLoader__.load({
 						t,
 						packages,
 						busy,
-						onSave: (name, description) => {
-							packagesOp({ op: 'save', sessionId, name, description })
+						onSave: (name, description, vars) => {
+							packagesOp({ op: 'save', sessionId, name, description, vars })
 								.then(() => reloadPackages())
 								.catch((err) => { if (mounted.current) setError(err.message || String(err)); });
 						},
-						onLoad: (id) => {
-							packagesOp({ op: 'load', sessionId, id })
+						onLoad: (id, vars) => {
+							packagesOp({ op: 'load', sessionId, id, vars })
 								.then((value) => {
 									if (!mounted.current) return;
 									setSnapshot(value);
