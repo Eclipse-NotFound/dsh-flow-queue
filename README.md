@@ -12,6 +12,62 @@ This plugin turns model switches, prompt delivery and command execution into **g
 - a switch lands between two turns — which is exactly "before the next input";
 - the order on the canvas is the execution order, and progress is visible while it runs.
 
+## Quickstart (5 minutes)
+
+From zero to a running **Prompt → Model switch → Branch** flow.
+
+### 1. Install
+
+```sh
+dsh plugin --profile web add github:Eclipse-NotFound/dsh-flow-queue
+```
+
+Then restart the Harness web runtime — bundles are composed at startup — and reload the page. Requires DSH `>=0.2.1-rc.1 <0.3.0`.
+
+**Check**: the plugin's icon appears at the sidebar foot beside Settings; hovering it says "Open the flow queue".
+
+### 2. Open the panel
+
+Click that icon, or the "Flow queue" card on the right sidebar's start page. The right sidebar gains a "Flow queue" tab, and the canvas lives inside it. Next to the title sit two view toggles, "Flow" and "Fleet" — this tour stays on "Flow" ("Fleet" manages the workspace's collaborating sessions).
+
+**Check**: the run chip beside the title reads "Idle"; the "Start" button on the far right is greyed out while the canvas is empty, with the `⋯` menu next to it; the panel footer shows `v0.7.0`.
+
+### 3. Add three cards
+
+In the second button row click `+Prompt`, then `+Model switch`, then `+Branch`. Each click adds a card to the canvas; the first card you added — the Prompt — is where the run starts.
+
+**Check**: three cards on the canvas with the type chips Prompt / Model switch / Branch.
+
+### 4. Fill the steps in
+
+Clicking a card (a press that does not move) opens its inspector drawer under the canvas, headed "Edit step"; `↓` closes it.
+
+- **Prompt** — write something decidable into the "Prompt text" box, e.g. "Confirm in one sentence that you received this message, then print exactly FLOW-OK on a new line", and save with `Ctrl/⌘ + Enter` (losing focus also saves). Leave "Model" on "Not set (keep current)".
+- **Model switch** — pick the target model from the "Model" dropdown; models that declare reasoning levels also let you pick a "Reasoning effort".
+- **Branch** — set "Condition" to "Contains text" and "Match value" to `FLOW-OK`.
+
+**Check**: the three card bodies now show the prompt's first line, `provider / model`, and `Contains text · FLOW-OK`.
+
+### 5. Connect
+
+Drag from the Prompt card's right dot onto the Model-switch card (or click the dot, then click the target card), then connect Model switch to Branch. Prompt and Model switch have one output dot (hover: "Next"); Branch has two, "Yes" and "No". To make the branch's direction visible, add a `+Checkpoint` card and connect "Yes" to it.
+
+**Check**: the three cards are chained by two connections; with the checkpoint added, the "Yes" dot carries a connection too.
+
+### 6. Run
+
+Press "Start". The prompt is delivered into the current session as a real user message; only after that turn ends — right before the next input — does the session switch models; the branch then evaluates the prompt turn's reply. Configuration steps like Model switch never overwrite the outcome conditions read.
+
+**Check**:
+
+- the run chip turns "Running", then "Done" when the whole flow finishes;
+- the Prompt card shows "Done", with the model that actually served it in its header;
+- with the checkpoint: a reply containing `FLOW-OK` takes "Yes" and stops at the checkpoint — the chip reads "Waiting" and "Continue" finishes the run; without it the flow ends directly, leaving the checkpoint card "Pending".
+
+Two running rules: edit the graph only while it is stopped (edits are rejected mid-run — "Pause" or "Stop" first), and pressing "Start" again resets every step's status and reruns from the top.
+
+To reuse this flow later, save it via `⋯ → Packages`; all nine step types are described under "Step types" below.
+
 ## Interface
 
 The plugin registers one right-sidebar tab, and the whole canvas lives inside it — no separate window:
