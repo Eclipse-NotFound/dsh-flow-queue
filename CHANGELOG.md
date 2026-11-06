@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented here.
 
+## 0.4.0 — 2026-11-06
+
+- Branch and loop conditions gain a `model judges` type: a natural-language condition such as "latency is below 10ms". Reaching the step starts exactly one minimal judge turn — roughly 40 instruction tokens plus the condition verbatim — and the model answers YES or NO on the first reply line; the engine parses that line and nothing else. The verdict (with a reason excerpt) shows on the card, `negate` applies, a reply without YES/NO fails the step as `no-decision`, and a loop re-judges fresh on every iteration. No tool is registered — a link-installed package cannot import the tool DSL, and a global judge tool would sit in every session's schema — so the prompt table of every session stays untouched.
+
 ## 0.3.0 — 2026-11-06
 
 - The prompt editor gains the composer's two affordances. Typing `/` at a line start opens the session's command catalog (host commands) and its skill catalog — a command inserts `/name `, a skill inserts a "use this skill" instruction the model loads from its own catalog. Typing `@` opens workspace file references through the Host's `@file` discovery (directories keep the menu open on their trailing slash); a reference is text, not injected content.

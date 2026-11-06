@@ -551,4 +551,62 @@ async function cleanup(harness) {
 
 //#endregion
 
+//#region scenario 10: a natural-language branch is judged by one model turn
+
+{
+	const h = await makeHarness();
+	const gate = await h.command({ op: 'node.add', kind: 'branch', condition: { type: 'judge', value: '卡顿降到 10ms 以下' } });
+	const yes = await h.command({ op: 'node.add', kind: 'model', provider: 'fast', model: 'm' });
+	const no = await h.command({ op: 'node.add', kind: 'model', provider: 'slow', model: 'm' });
+	await h.command({ op: 'edge.add', from: gate.node.id, port: 'yes', to: yes.node.id });
+	await h.command({ op: 'edge.add', from: gate.node.id, port: 'no', to: no.node.id });
+
+	await h.command({ op: 'run.start' });
+	await waitFor(() => h.world.calls.prompt.length === 1, 'the judge prompt to dispatch');
+	const judgeText = h.world.calls.prompt[0].content[0].text;
+	assert.ok(judgeText.includes('Condition: 卡顿降到 10ms 以下'), 'the judge prompt quotes the condition');
+	assert.ok(judgeText.length < 600, 'the judge prompt stays minimal');
+	assert.equal((await h.state()).run.waitingJudge, gate.node.id, 'the run waits on the judge node');
+
+	h.turnStart(1);
+	h.assistant(1, 'YES\n测得 7ms，低于阈值');
+	h.turnEnd(1);
+	await waitFor(() => h.world.calls.selectModel.length === 1, 'the yes edge to run');
+	assert.equal(h.world.calls.selectModel[0].provider, 'fast');
+	let snapshot = await h.state();
+	const gateView = snapshot.nodes.find((node) => node.id === gate.node.id);
+	assert.equal(gateView.status, 'completed');
+	assert.ok(gateView.result.startsWith('YES'), 'the card shows the verdict');
+	assert.equal(gateView.judge, undefined, 'the consumed verdict is not exposed');
+	assert.equal(snapshot.run.state, 'done');
+	await h.command({ op: 'graph.reset' });
+
+	// A NO answer takes the other edge; an unparsable reply fails the step.
+	h.world.calls.selectModel.length = 0;
+	h.world.calls.prompt.length = 0;
+	await h.command({ op: 'run.start' });
+	await waitFor(() => h.world.calls.prompt.length === 1, 'the second judge prompt');
+	h.turnStart(2);
+	h.assistant(2, 'NO\n仍在 23ms');
+	h.turnEnd(2);
+	await waitFor(() => h.world.calls.selectModel.length === 1, 'the no edge to run');
+	assert.equal(h.world.calls.selectModel[0].provider, 'slow');
+	await h.command({ op: 'graph.reset' });
+
+	h.world.calls.selectModel.length = 0;
+	h.world.calls.prompt.length = 0;
+	await h.command({ op: 'run.start' });
+	await waitFor(() => h.world.calls.prompt.length === 1, 'the third judge prompt');
+	h.turnStart(3);
+	h.assistant(3, '我觉得不太好说');
+	h.turnEnd(3);
+	snapshot = await waitForState(h, (value) => value.run.state === 'error', 'the unparsable judge to fail');
+	assert.equal(snapshot.run.message, 'no-decision');
+	assert.equal(snapshot.nodes.find((node) => node.id === gate.node.id).error.code, 'no-decision');
+
+	await cleanup(h);
+}
+
+//#endregion
+
 console.log('dsh-flow-queue offline check: all scenarios passed');

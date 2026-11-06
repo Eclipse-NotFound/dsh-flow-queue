@@ -44,7 +44,28 @@ const PORTS = {
 	branch: ['yes', 'no'],
 	loop: ['again', 'exit'],
 };
-const CONDITION_TYPES = new Set(['always', 'regex', 'contains', 'marker', 'tool-failed', 'last-failed']);
+const CONDITION_TYPES = new Set(['always', 'regex', 'contains', 'marker', 'tool-failed', 'last-failed', 'judge']);
+
+/**
+ * The whole judge protocol: one minimal turn in the same session. The model
+ * verifies with whatever cheapest check suffices and answers on the first
+ * line; the engine parses that line and nothing else. No tool registration
+ * (a link-installed package cannot import the tool DSL, and a global judge
+ * tool would sit in every session's schema), no free-text parsing beyond the
+ * first token.
+ */
+const JUDGE_INSTRUCTION = 'Judge the flow condition below, right now. Answer on the FIRST line with exactly YES or NO (met / not met); you may add one brief reason on the second line. Use the cheapest sufficient check, then answer.';
+
+/** Parse the judge verdict from the first non-empty line of the reply. */
+function parseJudgeAnswer(text) {
+	const firstLine = typeof text === 'string'
+		? text.split('\n').map((line) => line.trim()).find((line) => line !== '')
+		: undefined;
+	if (firstLine === undefined) return undefined;
+	const match = /^(yes|no|true|false|是|否)(?![a-z0-9])/i.exec(firstLine);
+	if (match === null) return undefined;
+	return /^(yes|true|是)/i.test(match[1]);
+}
 
 export const inject = ['webServer', 'connection', 'sessionController'];
 
@@ -120,6 +141,7 @@ function emptyRun() {
 		state: 'idle',
 		cursor: null,
 		waitingNode: null,
+		waitingJudge: null,
 		steps: 0,
 		message: '',
 		startedAt: 0,
@@ -345,6 +367,7 @@ export function apply(ctx, config = {}) {
 				state: typeof run.state === 'string' ? run.state : 'idle',
 				cursor: typeof run.cursor === 'string' && ids.has(run.cursor) ? run.cursor : null,
 				waitingNode: typeof run.waitingNode === 'string' && ids.has(run.waitingNode) ? run.waitingNode : null,
+				waitingJudge: typeof run.waitingJudge === 'string' && ids.has(run.waitingJudge) ? run.waitingJudge : null,
 				steps: Number.isFinite(run.steps) ? run.steps : 0,
 				message: typeof run.message === 'string' ? run.message.slice(0, 400) : '',
 				startedAt: Number.isFinite(run.startedAt) ? run.startedAt : 0,
@@ -435,6 +458,8 @@ export function apply(ctx, config = {}) {
 
 	function publicNode(node) {
 		const view = { ...node };
+		// The judge verdict is consumed on read; never expose the stale copy.
+		delete view.judge;
 		if (Array.isArray(node.attachments)) view.attachments = node.attachments.map(publicAttachment);
 		if (node.startedAt !== undefined && node.endedAt !== undefined) view.durationMs = node.endedAt - node.startedAt;
 		return view;
@@ -547,6 +572,7 @@ export function apply(ctx, config = {}) {
 			touchNode(node, 'failed');
 			node.error = fail('no-turn', 'the prompt was accepted but no turn started');
 			graph.run.waitingNode = null;
+			graph.run.waitingJudge = null;
 			graph.run.state = 'error';
 			graph.run.message = 'no-turn';
 			await persist(sessionId, current);
@@ -554,10 +580,45 @@ export function apply(ctx, config = {}) {
 		watchdogs.set(node.id, handle);
 	}
 
+	/**
+	 * Dispatch the one-turn judge prompt for a branch or loop whose condition is
+	 * natural language. The verdict lands on `node.judge` when that turn ends;
+	 * the next advance consumes it and picks the port. Each loop iteration asks
+	 * again — a judge answer is never reused across rounds.
+	 */
+	async function dispatchJudge(sessionId, graph, node) {
+		touchNode(node, 'running');
+		delete node.judge;
+		node.result = undefined;
+		graph.run.waitingJudge = node.id;
+		await persist(sessionId, graph);
+		await ctx.sessionController.prompt(
+			{
+				requestId: `flow-queue-judge-${randomUUID()}`,
+				sessionId,
+				mode: 'queue',
+				content: [{ type: 'text', text: `${JUDGE_INSTRUCTION}\nCondition: ${node.condition.value}` }],
+				clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+			},
+			new AbortController().signal,
+		);
+		armWatchdog(sessionId, graph, node);
+		return { wait: true };
+	}
+
+	/** Resolve a judge condition against the consumed verdict; negate applies. */
+	function judgeVerdict(node) {
+		const answer = node.judge.answer;
+		// Consume on read: a later visit of the same node asks again.
+		delete node.judge;
+		return node.condition.negate === true ? !answer : answer;
+	}
+
 	function finishRun(graph, state, message) {
 		graph.run.state = state;
 		graph.run.message = message ?? '';
 		graph.run.waitingNode = null;
+		graph.run.waitingJudge = null;
 		graph.run.cursor = null;
 		graph.run.endedAt = Date.now();
 	}
@@ -659,15 +720,23 @@ export function apply(ctx, config = {}) {
 				return { stop: true };
 			}
 			case 'branch': {
+				// A natural-language condition first needs its judge turn; the
+				// verdict arrives on node.judge when that turn ends.
+				if (node.condition.type === 'judge' && node.judge === undefined) {
+					return dispatchJudge(sessionId, graph, node);
+				}
 				touchNode(node, 'running');
-				const ok = evaluate(node.condition, graph.outcome);
+				const ok = node.condition.type === 'judge' ? judgeVerdict(node) : evaluate(node.condition, graph.outcome);
 				touchNode(node, 'completed');
 				node.title = ok ? '条件成立' : '条件不成立';
 				return { port: ok ? 'yes' : 'no' };
 			}
 			case 'loop': {
+				if (node.condition.type === 'judge' && node.judge === undefined) {
+					return dispatchJudge(sessionId, graph, node);
+				}
 				const used = graph.counters[node.id] ?? 0;
-				const done = evaluate(node.condition, graph.outcome);
+				const done = node.condition.type === 'judge' ? judgeVerdict(node) : evaluate(node.condition, graph.outcome);
 				if (done || used >= node.maxIterations) {
 					touchNode(node, 'completed');
 					node.result = used >= node.maxIterations && !done ? '达到最大轮数' : '满足退出条件';
@@ -841,11 +910,15 @@ export function apply(ctx, config = {}) {
 
 		if (event.type === 'turn/start') {
 			if (graph === undefined) return;
-			const node = runningPromptNode(graph);
-			if (node === undefined) return;
+			const promptNode = runningPromptNode(graph);
+			const judgeNode = graph.run.waitingJudge === null ? undefined : findNode(graph, graph.run.waitingJudge);
+			if (promptNode === undefined && judgeNode === undefined) return;
 			const turn = event.data === undefined ? undefined : event.data.turn;
-			if (typeof turn === 'number') node.turn = turn;
-			clearWatchdog(node.id);
+			for (const active of [promptNode, judgeNode]) {
+				if (active === undefined) continue;
+				if (typeof turn === 'number') active.turn = turn;
+				clearWatchdog(active.id);
+			}
 			return;
 		}
 
@@ -877,6 +950,30 @@ export function apply(ctx, config = {}) {
 			if (nextAfterPrompt === undefined) finishRun(graph, 'done', 'no outgoing connection');
 			else graph.run.cursor = nextAfterPrompt;
 			void persist(sessionId, graph);
+		}
+		// A judge turn just settled: parse its verdict off the same turn's text
+		// and leave the cursor on the branch/loop node so the next advance takes
+		// the yes/no edge.
+		if (graph.run.waitingJudge !== null) {
+			const judgeNode = findNode(graph, graph.run.waitingJudge);
+			graph.run.waitingJudge = null;
+			if (judgeNode !== undefined) {
+				clearWatchdog(judgeNode.id);
+				const lastTurn = graph.lastTurn !== undefined && graph.lastTurn.turn === data.turn ? graph.lastTurn : undefined;
+				const answer = parseJudgeAnswer(lastTurn === undefined ? '' : lastTurn.text);
+				if (answer === undefined) {
+					touchNode(judgeNode, 'failed');
+					judgeNode.error = fail('no-decision', 'the judge turn did not answer YES or NO on its first line');
+					graph.run.state = 'error';
+					graph.run.message = 'no-decision';
+				} else {
+					judgeNode.judge = { answer };
+					const reason = lastTurn === undefined || lastTurn.text === undefined ? '' : lastTurn.text.split('\n').slice(1).join(' ').trim().slice(0, 160);
+					judgeNode.result = `${answer ? 'YES' : 'NO'}${reason === '' ? '' : ` · ${reason}`}`;
+					graph.outcome = { kind: 'judge', text: `${judgeNode.condition.value}\n${lastTurn?.text ?? ''}`, ok: answer, toolErrors: [] };
+				}
+				void persist(sessionId, graph);
+			}
 		}
 		if (graph.run.state === 'running') later(() => advance(sessionId), SETTLE_MS);
 	});
@@ -1180,6 +1277,7 @@ export function apply(ctx, config = {}) {
 					delete node.usedModel;
 					delete node.turn;
 					delete node.result;
+					delete node.judge;
 				}
 				await persist(sessionId, graph);
 				return { state: publicState(graph) };
@@ -1199,6 +1297,7 @@ export function apply(ctx, config = {}) {
 						node.status = 'idle';
 						delete node.error;
 					}
+					delete node.judge;
 				}
 				graph.counters = {};
 				await persist(sessionId, graph);
@@ -1233,6 +1332,7 @@ export function apply(ctx, config = {}) {
 				graph.run.state = 'idle';
 				graph.run.cursor = null;
 				graph.run.waitingNode = null;
+				graph.run.waitingJudge = null;
 				graph.run.message = 'stopped';
 				graph.run.endedAt = Date.now();
 				await persist(sessionId, graph);

@@ -45,6 +45,7 @@ A condition is evaluated against the **most recent outcome** (for a prompt step:
 - `marker` — contains a completion marker (default `[[FLOW:DONE]]`; ask the model to print it when finished)
 - `tool failed last turn` (a `tool/result` error in that turn)
 - `last step failed` (the command failed, or the turn ended in error/abort)
+- `model judges` (**natural-language condition**, e.g. "latency is below 10ms"): reaching the step starts **one** minimal judge turn — about 40 instruction tokens plus the condition verbatim; the model verifies with the cheapest sufficient check and answers **YES or NO on the first line**, which is the only thing the engine parses. The card shows the verdict and a reason excerpt; a reply without YES/NO fails the step (`no-decision`). No global tool is registered and no session's tool table changes; inside a loop every iteration judges fresh.
 - every condition can be negated
 
 ### What a prompt step can carry

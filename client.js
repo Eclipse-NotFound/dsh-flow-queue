@@ -21,7 +21,7 @@ window.__ModuleLoader__.load({
 		const PORT_GAP = 22;
 		// Keep in sync with package.json. Shown in the panel footer so the page's
 		// running build is identifiable at a glance during remote diagnosis.
-		const CLIENT_VERSION = '0.3.0';
+		const CLIENT_VERSION = '0.4.0';
 
 		let localeSvc = null;
 		let pluginCtx = null;
@@ -104,12 +104,14 @@ window.__ModuleLoader__.load({
 				'cond.marker': '包含完成标记 [[FLOW:DONE]]',
 				'cond.tool-failed': '上一轮有工具失败',
 				'cond.last-failed': '上一步失败',
+				'cond.judge': '模型判断（自然语言）',
 				'cond.value.always': '',
 				'cond.value.regex': '(测试通过|all tests passed)',
 				'cond.value.contains': '关键词',
 				'cond.value.marker': '[[FLOW:DONE]]',
 				'cond.value.tool-failed': '',
 				'cond.value.last-failed': '',
+				'cond.value.judge': '卡顿降到 10ms 以下',
 				'port.next': '下一步',
 				'port.yes': '是',
 				'port.no': '否',
@@ -132,6 +134,7 @@ window.__ModuleLoader__.load({
 				'error.command': '操作失败',
 				'error.network': '连接失败',
 				'error.code.no-turn': '提示词已被接受，但没有启动新一轮',
+				'error.code.no-decision': '判定轮没有在首行回答 YES 或 NO',
 				'error.code.interrupted': 'Harness 重启中断了这一步',
 				'error.code.dispatch-failed': '派发失败',
 				'error.code.turn-error': '这一轮出错',
@@ -222,12 +225,14 @@ window.__ModuleLoader__.load({
 				'cond.marker': 'Contains [[FLOW:DONE]]',
 				'cond.tool-failed': 'A tool failed last turn',
 				'cond.last-failed': 'The previous step failed',
+				'cond.judge': 'Model judges (natural language)',
 				'cond.value.always': '',
 				'cond.value.regex': '(tests? passed|all green)',
 				'cond.value.contains': 'keyword',
 				'cond.value.marker': '[[FLOW:DONE]]',
 				'cond.value.tool-failed': '',
 				'cond.value.last-failed': '',
+				'cond.value.judge': 'latency is below 10ms',
 				'port.next': 'Next',
 				'port.yes': 'Yes',
 				'port.no': 'No',
@@ -250,6 +255,7 @@ window.__ModuleLoader__.load({
 				'error.command': 'The action failed',
 				'error.network': 'Connection failed',
 				'error.code.no-turn': 'The prompt was accepted but no turn started',
+				'error.code.no-decision': 'The judge turn did not answer YES or NO on its first line',
 				'error.code.interrupted': 'A Harness restart interrupted this step',
 				'error.code.dispatch-failed': 'Dispatch failed',
 				'error.code.turn-error': 'This turn failed',
@@ -292,7 +298,7 @@ window.__ModuleLoader__.load({
 
 		const KIND_ORDER = ['prompt', 'model', 'command', 'branch', 'loop', 'checkpoint'];
 		const PORT_LABEL = { next: 'port.next', yes: 'port.yes', no: 'port.no', again: 'port.again', exit: 'port.exit' };
-		const CONDITION_TYPES = ['always', 'regex', 'contains', 'marker', 'tool-failed', 'last-failed'];
+		const CONDITION_TYPES = ['always', 'regex', 'contains', 'marker', 'tool-failed', 'last-failed', 'judge'];
 
 		const srOnly = {
 			position: 'absolute',
