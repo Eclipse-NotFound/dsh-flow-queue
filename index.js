@@ -684,6 +684,30 @@ export function apply(ctx, config = {}) {
 				if (override !== undefined) {
 					await ctx.sessionController.selectModel({ sessionId, ...override });
 				}
+				// A prompt whose entire text is one host command line runs as that
+				// command — the composer never silently downgrades a command line to
+				// a plain prompt, and neither does a queued step.
+				const inline = await inlineCommandOf(sessionId, node);
+				if (inline !== undefined) {
+					touchNode(node, 'running');
+					await persist(sessionId, graph);
+					const execution = await inline.commands.execute(inline.agent, inline.line, [], new AbortController().signal);
+					if (execution === undefined) {
+						touchNode(node, 'failed');
+						node.error = fail('unknown-command', `no command resolved for ${inline.line}`);
+					} else {
+						node.result = typeof execution.result?.text === 'string' ? execution.result.text.slice(0, 4000) : '';
+						if (execution.result?.kind === 'success') {
+							touchNode(node, 'completed');
+							graph.outcome = { kind: 'command', text: node.result, ok: true, toolErrors: [] };
+						} else {
+							touchNode(node, 'failed');
+							node.error = fail('command-failed', node.result);
+							graph.outcome = { kind: 'command', text: node.result, ok: false, toolErrors: [] };
+						}
+					}
+					return { port: 'next' };
+				}
 				touchNode(node, 'running');
 				graph.run.waitingNode = node.id;
 				await persist(sessionId, graph);
@@ -708,6 +732,25 @@ export function apply(ctx, config = {}) {
 				return { wait: true };
 			}
 		}
+	}
+
+	/**
+	 * Resolve the inline command a prompt step carries, when its whole text is
+	 * exactly one host command line (`/name args…`). Client-owned popup commands
+	 * (`popupSelect` surfaces like the model picker) have no host row and stay
+	 * plain prompt text.
+	 */
+	async function inlineCommandOf(sessionId, node) {
+		const commands = ctx.get('commands');
+		if (commands === undefined || typeof commands.find !== 'function') return undefined;
+		const text = typeof node.text === 'string' ? node.text.trim() : '';
+		if (!text.startsWith('/') || text.includes('\n')) return undefined;
+		const name = text.slice(1).split(/\s+/)[0] ?? '';
+		if (name === '' || !/^[A-Za-z0-9_-]+$/.test(name)) return undefined;
+		const resolved = await ctx.sessionController.resolveAgent(sessionId);
+		if (resolved === undefined || resolved.agent === undefined) return undefined;
+		if (commands.find(resolved.agent, name) === undefined) return undefined;
+		return { commands, agent: resolved.agent, line: text };
 	}
 
 	async function advance(sessionId) {
@@ -1222,6 +1265,107 @@ export function apply(ctx, config = {}) {
 	function admitted(request) {
 		return ctx.connection.requestRejection(request) === undefined;
 	}
+
+	/** Session-scoped "/" catalog (host commands + skills), refreshed at most this often. */
+	const MENTION_CACHE_MS = 30000;
+	const mentionCache = new Map();
+
+	async function slashCatalog(sessionId) {
+		const cached = mentionCache.get(sessionId);
+		if (cached !== undefined && Date.now() - cached.at < MENTION_CACHE_MS) return cached.value;
+		const commands = [];
+		const skills = [];
+		const resolved = await ctx.sessionController.resolveAgent(sessionId);
+		const agent = resolved !== undefined ? resolved.agent : undefined;
+		if (agent !== undefined) {
+			const registry = ctx.get('commands');
+			if (registry !== undefined && typeof registry.list === 'function') {
+				for (const descriptor of await registry.list(agent)) {
+					if (descriptor === null || typeof descriptor !== 'object' || typeof descriptor.name !== 'string') continue;
+					if (!/^[A-Za-z0-9_-]+$/.test(descriptor.name)) continue;
+					commands.push({
+						name: descriptor.name,
+						description: typeof descriptor.description === 'string' ? descriptor.description.slice(0, 200) : '',
+					});
+				}
+			}
+			const skillRegistry = ctx.get('skills');
+			const workingDirectory = ctx.get('workingDirectory');
+			if (skillRegistry !== undefined && typeof skillRegistry.list === 'function') {
+				const cwd = workingDirectory !== undefined && agent.session !== undefined ? workingDirectory.get(agent.session) : undefined;
+				const listed = await skillRegistry.list({ cwd });
+				for (const skill of Array.isArray(listed) ? listed : []) {
+					if (skill === null || typeof skill !== 'object' || typeof skill.name !== 'string') continue;
+					if (skill.invocation !== undefined && skill.invocation.userInvocable !== true && skill.invocation.modelInvocable !== true) continue;
+					skills.push({
+						name: skill.name,
+						description: typeof skill.description === 'string' ? skill.description.slice(0, 200) : '',
+						userInvocable: skill.invocation?.userInvocable === true,
+					});
+				}
+			}
+		}
+		commands.sort((left, right) => left.name.localeCompare(right.name));
+		skills.sort((left, right) => left.name.localeCompare(right.name));
+		const value = { commands, skills };
+		mentionCache.set(sessionId, { at: Date.now(), value });
+		return value;
+	}
+
+	async function fileCandidates(sessionId, query, signal) {
+		const references = ctx.get('fileReferences');
+		if (references === undefined || typeof references.list !== 'function') return [];
+		const resolved = await ctx.sessionController.resolveAgent(sessionId);
+		const agent = resolved !== undefined ? resolved.agent : undefined;
+		if (agent === undefined) return [];
+		const listed = await references.list(agent, typeof query === 'string' ? query : '', signal);
+		const files = [];
+		for (const candidate of Array.isArray(listed) ? listed : []) {
+			if (candidate === null || typeof candidate !== 'object' || typeof candidate.path !== 'string') continue;
+			files.push({ path: candidate.path, kind: candidate.kind === 'directory' ? 'directory' : 'file' });
+			if (files.length >= 20) break;
+		}
+		return files;
+	}
+
+	ctx.on('session/disposed', (session) => {
+		mentionCache.delete(session.id);
+	});
+
+	ctx.effect(
+		() =>
+			ctx.webServer.register({
+				kind: 'exact',
+				path: `${PREFIX}/mention`,
+				handler: async (req, res) => {
+					if (!admitted(req)) return writeJson(res, 403, { ok: false, error: fail('forbidden', 'forbidden') });
+					if (req.method !== 'GET' && req.method !== 'HEAD') return writeJson(res, 405, { ok: false, error: fail('method-error', 'method not allowed') });
+					let sessionId = '';
+					let kind = '';
+					let query = '';
+					try {
+						const url = new URL(req.url ?? '/', 'http://dsh.internal');
+						sessionId = url.searchParams.get('sessionId') ?? '';
+						kind = url.searchParams.get('kind') ?? '';
+						query = url.searchParams.get('query') ?? '';
+					} catch {
+						/* fall through with the empty values */
+					}
+					if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) {
+						return writeJson(res, 400, { ok: false, error: fail('invalid-session', 'missing or invalid sessionId') });
+					}
+					try {
+						const value = kind === 'file'
+							? { files: await fileCandidates(sessionId, query, new AbortController().signal) }
+							: await slashCatalog(sessionId);
+						writeJson(res, 200, { ok: true, value });
+					} catch (error) {
+						writeJson(res, 500, { ok: false, error: fail('mention-failed', error instanceof Error ? error.message : String(error)) });
+					}
+				},
+			}),
+		'dsh-flow-queue: mention route',
+	);
 
 	ctx.effect(
 		() =>

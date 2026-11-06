@@ -69,10 +69,39 @@ async function makeHarness() {
 			}
 			if (name === 'commands') {
 				return {
+					find(agent, name) {
+						return name === 'compact' || name === 'echo' ? { name, description: `the ${name} command` } : undefined;
+					},
+					async list(agent) {
+						return [
+							{ name: 'compact', description: 'the compact command' },
+							{ name: 'echo', description: 'the echo command' },
+						];
+					},
 					async execute(agent, line) {
 						calls.command.push({ agent, line });
 						if (line.startsWith('/unknown')) return undefined;
 						return { commandId: 'cmd-1', result: { kind: 'success', text: `ran ${line}` } };
+					},
+				};
+			}
+			if (name === 'skills') {
+				return {
+					async list(options) {
+						return [
+							{ name: 'code-review', description: 'Review code changes', invocation: { modelInvocable: true, userInvocable: true } },
+							{ name: 'hidden-skill', description: 'Neither surface may load this', invocation: { modelInvocable: false, userInvocable: false } },
+						];
+					},
+				};
+			}
+			if (name === 'fileReferences') {
+				return {
+					async list(agent, query) {
+						return [
+							{ path: 'src/app.ts', kind: 'file' },
+							{ path: 'docs', kind: 'directory' },
+						];
 					},
 				};
 			}
@@ -471,6 +500,51 @@ async function cleanup(harness) {
 	assert.equal(stored.version, 2);
 	assert.equal(stored.nodes.length, 2);
 	assert.equal(stored.edges.length, 1);
+
+	await cleanup(h);
+}
+
+//#endregion
+
+//#region scenario 9: the mention route and inline command lines
+
+{
+	const h = await makeHarness();
+
+	const slash = await (await h.call('/flow-queue/api/mention', { search: `?sessionId=${SESSION}&kind=slash` })).json;
+	assert.equal(slash.ok, true);
+	assert.ok(slash.value.commands.some((entry) => entry.name === 'compact'));
+	assert.ok(slash.value.skills.some((entry) => entry.name === 'code-review'));
+	assert.equal(slash.value.skills.some((entry) => entry.name === 'hidden-skill'), false, 'skills blocked on both surfaces are not offered');
+
+	const files = await (await h.call('/flow-queue/api/mention', { search: `?sessionId=${SESSION}&kind=file&query=src` })).json;
+	assert.equal(files.ok, true);
+	assert.deepEqual(files.value.files, [
+		{ path: 'src/app.ts', kind: 'file' },
+		{ path: 'docs', kind: 'directory' },
+	]);
+
+	// A prompt whose whole text is one host command line runs as that command.
+	const inline = await h.command({ op: 'node.add', kind: 'prompt', text: '/compact now' });
+	await h.command({ op: 'run.start' });
+	await waitFor(() => h.world.calls.command.length >= 1, 'the inline command to execute');
+	assert.equal(h.world.calls.prompt.length, 0, 'an inline command line is never sent as a prompt');
+	let snapshot = await h.state();
+	let inlineNode = snapshot.nodes.find((node) => node.id === inline.node.id);
+	assert.equal(inlineNode.status, 'completed');
+	assert.equal(inlineNode.result, 'ran /compact now');
+	await h.command({ op: 'graph.reset' });
+
+	// Multi-line text starting with a slash, and unknown commands, stay prompts.
+	const multi = await h.command({ op: 'node.add', kind: 'prompt', text: '/compact everything\nand then summarize' });
+	await h.command({ op: 'run.start', id: multi.node.id });
+	await waitFor(() => h.world.calls.prompt.length === 1, 'the multi-line prompt to dispatch');
+	assert.equal(h.world.calls.prompt[0].content[0].text, '/compact everything\nand then summarize');
+	h.turnEnd(1);
+	snapshot = await waitForState(h, (value) => value.run.state === 'done', 'the multi-line run to settle');
+
+	const unknown = snapshot.nodes.find((node) => node.id === multi.node.id);
+	assert.equal(unknown.status, 'completed');
 
 	await cleanup(h);
 }

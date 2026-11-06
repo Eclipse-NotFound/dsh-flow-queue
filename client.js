@@ -21,7 +21,7 @@ window.__ModuleLoader__.load({
 		const PORT_GAP = 22;
 		// Keep in sync with package.json. Shown in the panel footer so the page's
 		// running build is identifiable at a glance during remote diagnosis.
-		const CLIENT_VERSION = '0.2.6';
+		const CLIENT_VERSION = '0.3.0';
 
 		let localeSvc = null;
 		let pluginCtx = null;
@@ -73,6 +73,14 @@ window.__ModuleLoader__.load({
 				'inspector.empty': '选中一个步骤来编辑它；点画布空白处取消选择。',
 				'inspector.title': '编辑步骤',
 				'inspector.text': '提示词内容',
+				'inspector.promptHint': '行首 / 呼出命令与技能，@ 引用文件',
+				'mention.commands': '命令',
+				'mention.skills': '技能',
+				'mention.files': '文件',
+				'mention.directory': '目录',
+				'mention.empty': '无匹配',
+				'mention.searching': '搜索中…',
+				'skill.invoke': '使用技能 {name}：',
 				'inspector.command': '命令（例如 /compact）',
 				'inspector.model': '模型',
 				'inspector.modelInherit': '不设置（沿用当前）',
@@ -183,6 +191,14 @@ window.__ModuleLoader__.load({
 				'inspector.empty': 'Select a step to edit it; click empty canvas to deselect.',
 				'inspector.title': 'Edit step',
 				'inspector.text': 'Prompt text',
+				'inspector.promptHint': 'type / for commands and skills, @ to reference a file',
+				'mention.commands': 'Cmd',
+				'mention.skills': 'Skill',
+				'mention.files': 'File',
+				'mention.directory': 'directory',
+				'mention.empty': 'No matches',
+				'mention.searching': 'Searching…',
+				'skill.invoke': 'Use the {name} skill: ',
 				'inspector.command': 'Command (for example /compact)',
 				'inspector.model': 'Model',
 				'inspector.modelInherit': 'Not set (keep current)',
@@ -352,6 +368,12 @@ window.__ModuleLoader__.load({
 				headers: { 'content-type': 'application/json' },
 				body: JSON.stringify(payload),
 			}).then(unwrap);
+		}
+
+		/** "/" catalog (host commands + skills) or "@" file candidates for one session. */
+		function readMention(sessionId, kind, query) {
+			const search = `?sessionId=${encodeURIComponent(sessionId)}&kind=${encodeURIComponent(kind)}${query === '' ? '' : `&query=${encodeURIComponent(query)}`}`;
+			return requestJson(`/flow-queue/api/mention${search}`).then(unwrap);
 		}
 
 		function errorText(t, error) {
@@ -1078,6 +1100,252 @@ window.__ModuleLoader__.load({
 			);
 		}
 
+		/**
+		 * Prompt text editor with the composer's two affordances:
+		 * "/" at a line start opens the command + skill catalog, "@" opens
+		 * workspace file references. Accepting an item writes plain text back —
+		 * a @path stays a reference the model resolves itself (native @file
+		 * semantics), and a whole-line /command is executed by the Host at the
+		 * turn boundary instead of being sent as a prompt.
+		 */
+		function PromptEditor(props) {
+			const t = props.t;
+			const areaRef = useRef(null);
+			const caretRef = useRef(-1);
+			const slashCacheRef = useRef(null);
+			const fileTimerRef = useRef(undefined);
+			const fetchIdRef = useRef(0);
+			const menuRef = useRef(null);
+			const [menu, setMenuState] = useState(null);
+			// menu: { kind, start, caret, query, items, highlight, loading }
+
+			const setMenu = useCallback((next) => {
+				const value = typeof next === 'function' ? next(menuRef.current) : next;
+				menuRef.current = value;
+				setMenuState(value);
+			}, []);
+
+			const closeMenu = useCallback(() => setMenu(null), [setMenu]);
+
+			const filterSlash = useCallback((catalog, query) => {
+				const needle = query.trim().toLowerCase();
+				const matches = (entry) => needle === ''
+					|| entry.name.toLowerCase().includes(needle)
+					|| (entry.description ?? '').toLowerCase().includes(needle);
+				const commands = (catalog?.commands ?? []).filter(matches).slice(0, 8)
+					.map((entry) => ({ type: 'command', name: entry.name, description: entry.description, insert: `/${entry.name} ` }));
+				const skills = (catalog?.skills ?? []).filter(matches).slice(0, 8)
+					.map((entry) => ({ type: 'skill', name: entry.name, description: entry.description, insert: t('skill.invoke', { name: entry.name }) }));
+				return [...commands, ...skills];
+			}, [t]);
+
+			const updateMenu = useCallback((text, caret) => {
+				const before = text.slice(0, caret);
+				const lineStart = before.lastIndexOf('\n') + 1;
+				const line = before.slice(lineStart);
+				let token = null;
+				if (/^\/[A-Za-z0-9_-]*$/.test(line)) token = { kind: 'slash', start: lineStart, query: line.slice(1) };
+				else {
+					const match = /(?:^|\s)@([^\s@]*)$/.exec(before);
+					if (match !== null) token = { kind: 'file', start: caret - match[1].length - 1, query: match[1] };
+				}
+				if (token === null) {
+					closeMenu();
+					return;
+				}
+				if (token.kind === 'slash') {
+					const cache = slashCacheRef.current;
+					if (cache !== null && Date.now() - cache.at < 30000) {
+						setMenu({ kind: 'slash', start: token.start, caret, query: token.query, items: filterSlash(cache.value, token.query), highlight: 0, loading: false });
+						return;
+					}
+					const fetchId = fetchIdRef.current + 1;
+					fetchIdRef.current = fetchId;
+					setMenu({ kind: 'slash', start: token.start, caret, query: token.query, items: [], highlight: 0, loading: true });
+					readMention(props.sessionId, 'slash', '')
+						.then((value) => {
+							if (fetchIdRef.current !== fetchId) return;
+							slashCacheRef.current = { at: Date.now(), value };
+							setMenu((current) => current !== null && current.kind === 'slash'
+								? { ...current, items: filterSlash(value, current.query), loading: false }
+								: current);
+						})
+						.catch(() => {
+							if (fetchIdRef.current !== fetchId) return;
+							setMenu((current) => current !== null && current.kind === 'slash' ? { ...current, loading: false } : current);
+						});
+					return;
+				}
+				const fetchId = fetchIdRef.current + 1;
+				fetchIdRef.current = fetchId;
+				setMenu({ kind: 'file', start: token.start, caret, query: token.query, items: [], highlight: 0, loading: true });
+				clearTimeout(fileTimerRef.current);
+				fileTimerRef.current = setTimeout(() => {
+					readMention(props.sessionId, 'file', token.query)
+						.then((value) => {
+							if (fetchIdRef.current !== fetchId) return;
+							const files = (value?.files ?? []).slice(0, 20).map((entry) => ({
+								type: 'file',
+								name: entry.kind === 'directory' ? `${entry.path}/` : entry.path,
+								description: entry.kind === 'directory' ? t('mention.directory') : '',
+								directory: entry.kind === 'directory',
+								insert: entry.kind === 'directory' ? `${entry.path}/` : `${entry.path} `,
+							}));
+							setMenu((current) => current !== null && current.kind === 'file'
+								? { ...current, items: files, loading: false }
+								: current);
+						})
+						.catch(() => {
+							if (fetchIdRef.current !== fetchId) return;
+							setMenu((current) => current !== null && current.kind === 'file' ? { ...current, loading: false } : current);
+						});
+				}, 180);
+			}, [closeMenu, filterSlash, props.sessionId, t]);
+
+			const accept = useCallback((item) => {
+				const current = menuRef.current;
+				const area = areaRef.current;
+				if (current === null) return;
+				const text = props.value ?? '';
+				const next = `${text.slice(0, current.start)}${item.insert}${text.slice(current.caret)}`;
+				// A directory insertion closes the menu, but the caret lands on the
+				// trailing slash, so the caret-restore effect reopens it with the
+				// narrowed query — the same continuation the native composer has.
+				caretRef.current = current.start + item.insert.length;
+				setMenu(null);
+				props.onChangeText(next);
+				if (area !== null) area.focus();
+			}, [props, setMenu]);
+
+			// Restore the caret after an accepted insertion re-renders the textarea.
+			useEffect(() => {
+				if (caretRef.current < 0) return;
+				const area = areaRef.current;
+				const position = caretRef.current;
+				caretRef.current = -1;
+				if (area !== null) {
+					area.selectionStart = position;
+					area.selectionEnd = position;
+					const after = props.value ?? '';
+					updateMenu(after, position);
+				}
+			}, [props.value, updateMenu]);
+
+			const onKeyDown = (event) => {
+				if (menu !== null && menu.items.length > 0) {
+					if (event.key === 'ArrowDown') {
+						event.preventDefault();
+						setMenu({ ...menu, highlight: (menu.highlight + 1) % menu.items.length });
+						return;
+					}
+					if (event.key === 'ArrowUp') {
+						event.preventDefault();
+						setMenu({ ...menu, highlight: (menu.highlight - 1 + menu.items.length) % menu.items.length });
+						return;
+					}
+					if (event.key === 'Enter' || event.key === 'Tab') {
+						event.preventDefault();
+						accept(menu.items[menu.highlight]);
+						return;
+					}
+				}
+				if (event.key === 'Escape' && menu !== null) {
+					event.preventDefault();
+					closeMenu();
+					return;
+				}
+				if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+					event.preventDefault();
+					props.onCommit();
+				}
+			};
+
+			const menuElement = menu === null ? null : h(
+				'div',
+				{
+					style: {
+						position: 'absolute',
+						left: 0,
+						right: 0,
+						bottom: '100%',
+						marginBottom: '4px',
+						maxHeight: '180px',
+						overflowY: 'auto',
+						background: C.surface,
+						border: `1px solid ${C.border}`,
+						borderRadius: '8px',
+						boxShadow: '0 8px 24px rgba(0,0,0,0.28)',
+						zIndex: 6,
+					},
+				},
+				menu.loading
+					? h('div', { style: { padding: '6px 9px', fontSize: '11px', color: C.dimmer } }, t('mention.searching'))
+					: menu.items.length === 0
+						? h('div', { style: { padding: '6px 9px', fontSize: '11px', color: C.dimmer } }, t('mention.empty'))
+						: menu.items.map((item, index) =>
+							h(
+								'div',
+								{
+									key: `${item.type}:${item.name}`,
+									onPointerDown: (event) => event.preventDefault(),
+									onClick: () => accept(item),
+									style: {
+										display: 'flex',
+										alignItems: 'center',
+										gap: '6px',
+										padding: '5px 9px',
+										cursor: 'pointer',
+										background: index === menu.highlight ? C.hover : 'transparent',
+									},
+								},
+								h('span', {
+									style: {
+										fontSize: '9px',
+										flex: 'none',
+										border: `1px solid ${item.type === 'skill' ? C.success : item.type === 'file' ? C.warn : C.accent}`,
+										color: item.type === 'skill' ? C.success : item.type === 'file' ? C.warn : C.accent,
+										borderRadius: '999px',
+										padding: '0 5px',
+										lineHeight: '14px',
+									},
+								}, t(`mention.${item.type === 'file' ? 'files' : item.type === 'skill' ? 'skills' : 'commands'}`)),
+								h('span', { style: { fontSize: '12px', color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 } }, item.name),
+								item.description !== ''
+									? h('span', { style: { fontSize: '10px', color: C.dimmer, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '45%' }, title: item.description }, item.description)
+									: null,
+							)),
+			);
+
+			return h(
+				'div',
+				{ style: { position: 'relative', display: 'flex', flexDirection: 'column' } },
+				menuElement,
+				h('textarea', {
+					ref: areaRef,
+					value: props.value ?? '',
+					rows: 6,
+					placeholder: `${t('inspector.text')} — ${t('inspector.promptHint')}`,
+					style: { ...inputStyle, resize: 'vertical', minHeight: '96px' },
+					onChange: (event) => {
+						props.onChangeText(event.target.value);
+						updateMenu(event.target.value, event.target.selectionStart ?? event.target.value.length);
+					},
+					onKeyUp: (event) => {
+						if (event.key === 'ArrowLeft' || event.key === 'ArrowRight' || event.key === 'Home' || event.key === 'End') {
+							updateMenu(props.value ?? '', event.target.selectionStart ?? 0);
+						}
+					},
+					onClick: (event) => updateMenu(props.value ?? '', event.target.selectionStart ?? 0),
+					onKeyDown,
+					onBlur: () => {
+						// Commit on blur like the previous plain textarea, but let a
+						// menu click settle first (pointerdown is prevented above).
+						setTimeout(() => props.onCommit(), 120);
+					},
+				}),
+			);
+		}
+
 		function AttachmentList(props) {
 			const t = props.t;
 			const attachments = Array.isArray(props.node.attachments) ? props.node.attachments : [];
@@ -1136,18 +1404,12 @@ window.__ModuleLoader__.load({
 
 			if (node.kind === 'prompt') {
 				rows.push(h(Field, { key: 'text', label: t('inspector.text') },
-					h('textarea', {
+					h(PromptEditor, {
+						t,
+						sessionId: props.sessionId,
 						value: text,
-						rows: 6,
-						style: { ...inputStyle, resize: 'vertical', minHeight: '96px' },
-						onChange: (event) => setText(event.target.value),
-						onBlur: () => patch({ text }),
-						onKeyDown: (event) => {
-							if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
-								event.preventDefault();
-								patch({ text });
-							}
-						},
+						onChangeText: setText,
+						onCommit: () => patch({ text }),
 					})));
 				rows.push(h(Field, { key: 'model', label: t('inspector.model') },
 					h(ModelSelect, {
@@ -1665,6 +1927,7 @@ window.__ModuleLoader__.load({
 					{ style: { flex: 1, minHeight: 0, overflowY: 'auto', padding: '8px 10px' } },
 					h(Inspector, {
 						t,
+						sessionId,
 						node: selectedNode,
 						catalog: models,
 						busy,

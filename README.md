@@ -54,7 +54,14 @@ A condition is evaluated against the **most recent outcome** (for a prompt step:
 - any file attachment (`attachments.admitEncodedFile` → `file` content part);
 - a model override for this step (empty = keep the current one).
 
-**Known difference:** `@path` references are expanded by the native composer at submit time. The graph editor does not go through the composer, so `@` is sent as plain text — attach the file instead. Up to 8 attachments per step.
+**`/` commands and skills, `@` file references** — the prompt editor keeps the composer's two habits:
+
+- typing `/` at a line start opens the session's **command** catalog (host commands such as `/compact`) and its **skill** catalog; ↑↓ walks, Enter/Tab accepts, Escape closes. A command inserts `/name `, a skill inserts "Use the {name} skill: " for the model to load from its catalog.
+- typing `@` opens **workspace file references** (native `@file` semantics: the path is referenced, content is not injected — the model reads it itself); picking a directory keeps the menu open on its trailing slash.
+- a prompt step whose **entire text is one host command line** (just `/compact`) runs as that command at the turn boundary instead of being sent to the model — the composer's "a command line is never silently downgraded to a plain prompt" rule, kept for queued steps too. Multi-line text and unknown commands are still delivered as prompts.
+- commands that exist only as client popups (pickers without a host command row, such as `/model`) are neither offered in the menu nor executed inline.
+
+**Known difference:** an `@path` is a text reference, not injected content — use "Add attachment" to ship the bytes. Up to 8 attachments per step.
 
 ## Run states
 

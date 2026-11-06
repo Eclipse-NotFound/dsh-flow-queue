@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## 0.3.0 — 2026-11-06
+
+- The prompt editor gains the composer's two affordances. Typing `/` at a line start opens the session's command catalog (host commands) and its skill catalog — a command inserts `/name `, a skill inserts a "use this skill" instruction the model loads from its own catalog. Typing `@` opens workspace file references through the Host's `@file` discovery (directories keep the menu open on their trailing slash); a reference is text, not injected content.
+- A prompt step whose entire text is exactly one host command line now runs as that command at the turn boundary instead of being sent to the model, matching the composer's rule that a command line is never silently downgraded to a plain prompt. Multi-line text and unknown commands are still delivered as prompts.
+- New Host route `GET /flow-queue/api/mention` serves the two catalogs per session (commands and skills cached 30 s; file candidates live).
+
 ## 0.2.6 — 2026-11-06
 
 - Fix: connections never worked in any version. The output port called its start handler with only `(port, event)`, so the drag carried the port name as the source node id and the Host rightly rejected the edge (`no such node`). The port now passes the owning node's id with the port.
