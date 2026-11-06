@@ -1014,4 +1014,61 @@ async function cleanup(harness) {
 
 //#endregion
 
+//#region scenario 21: fleet.stop pauses the live run, idempotently
+
+{
+	const h = await makeHarness({ outboxPumpMs: 400 });
+	h.world.promptFailFor = new Set(['T5']);
+	const added = await fleetOp(h, { op: 'session.add', targetSessionId: 'T5', alias: 'slow' });
+
+	const send = await h.command({ op: 'node.add', kind: 'send', text: 'stuck', targetRef: added.session.nodeId });
+	const work = await h.command({ op: 'node.add', kind: 'prompt', text: 'still open' });
+	await h.command({ op: 'edge.add', from: send.node.id, port: 'next', to: work.node.id });
+	await h.command({ op: 'run.start' });
+	await waitFor(() => h.world.calls.prompt.some((request) => request.sessionId === SESSION), 'the flow to reach its prompt step');
+
+	// The run is live with an open turn: fleet.stop must pause it.
+	const firstStop = await fleetOp(h, { op: 'stop' });
+	assert.equal(firstStop.paused, 1);
+	const paused = await waitForState(h, (value) => value.run.state === 'paused', 'the run to be paused');
+	assert.equal(paused.run.waitingNode, null);
+	assert.equal(h.world.calls.prompt.length >= 1, true, 'nothing new was dispatched after the stop');
+
+	const again = await fleetOp(h, { op: 'stop' });
+	assert.equal(again.paused, 0, 'a second stop pauses nothing new');
+
+	await cleanup(h);
+}
+
+//#endregion
+
+//#region scenario 22: the report-protocol package ships and loads
+
+{
+	const h = await makeHarness();
+	let entry;
+	for (let attempt = 0; attempt < 100 && entry === undefined; attempt += 1) {
+		const listed = await h.call(ROUTES.packages);
+		assert.equal(listed.status, 200);
+		entry = listed.json.value.find((item) => item.id === 'report-protocol');
+		if (entry === undefined) await sleep(30);
+	}
+	assert.ok(entry, 'the report protocol package is present');
+	assert.equal(entry.nodes, 2);
+
+	const loaded = await h.call(ROUTES.packages, { method: 'POST', body: { op: 'load', sessionId: SESSION, id: 'report-protocol' } });
+	assert.equal(loaded.status, 200, `load failed: ${JSON.stringify(loaded.json && loaded.json.error)}`);
+	const state = loaded.json.value;
+	assert.equal(state.nodes.length, 2);
+	const waitNode = state.nodes.find((node) => node.kind === 'wait');
+	assert.equal(waitNode.until, 'marker');
+	assert.equal(waitNode.marker, '[[FLOW:REPORT ready]]');
+	const promptNode = state.nodes.find((node) => node.kind === 'prompt');
+	assert.ok(promptNode.text.includes('[[FLOW:REPORT ready]]'), 'the worker template pins the four-state marker');
+
+	await cleanup(h);
+}
+
+//#endregion
+
 console.log('dsh-flow-queue offline check: all scenarios passed');

@@ -21,7 +21,7 @@ window.__ModuleLoader__.load({
 		const PORT_GAP = 22;
 		// Keep in sync with package.json. Shown in the panel footer so the page's
 		// running build is identifiable at a glance during remote diagnosis.
-		const CLIENT_VERSION = '0.6.0';
+		const CLIENT_VERSION = '0.7.0';
 
 		let localeSvc = null;
 		let pluginCtx = null;
@@ -113,6 +113,8 @@ window.__ModuleLoader__.load({
 				'fleet.viewFleet': '编制',
 				'fleet.backToFleet': '‹ 编制',
 				'fleet.self': '本会话',
+				'fleet.contextTokens': '上下文 ≈{v}',
+				'fleet.stopAll': '停整队',
 				'error.code.no-target': '目标会话不在编制中，也不是合法会话 ID',
 				'error.code.hop-limit': '通信跳数达到上限（可在编制页重置）',
 				'error.code.wait-timeout': '等待超时：目标没有在时限内满足条件',
@@ -292,6 +294,8 @@ window.__ModuleLoader__.load({
 				'fleet.viewFleet': 'Fleet',
 				'fleet.backToFleet': '‹ Fleet',
 				'fleet.self': 'this session',
+				'fleet.contextTokens': 'context ≈{v}',
+				'fleet.stopAll': 'Stop fleet',
 				'error.code.no-target': 'the target session is not in the fleet and not a valid session id',
 				'error.code.hop-limit': 'the send-hop cap was reached (reset it on the Fleet page)',
 				'error.code.wait-timeout': 'wait timed out before the target satisfied the condition',
@@ -1998,6 +2002,13 @@ window.__ModuleLoader__.load({
 			return `${Math.floor(hours / 24)}d`;
 		}
 
+		function formatTokens(value) {
+			if (!Number.isFinite(value) || value <= 0) return '0';
+			if (value >= 1000000) return `${(value / 1000000).toFixed(1)}M`;
+			if (value >= 1000) return `${(value / 1000).toFixed(1)}k`;
+			return String(Math.round(value));
+		}
+
 		/**
 		 * The L0 fleet view: the workspace's sessions as cards (busy light,
 		 * role, outbox state), the communication edges between them, and
@@ -2076,6 +2087,9 @@ window.__ModuleLoader__.load({
 				h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px', alignItems: 'center' } },
 					h('span', { style: { fontSize: '10px', color: C.dim } }, t(`fleet.status.${session.agentStatus || 'offline'}`)),
 					h('span', { style: { fontSize: '10px', color: C.dimmer } }, `${t('fleet.lastActive')} ${relativeTime(session.lastTurnEndAt)}`),
+					Number.isFinite(session.contextTokens) && session.contextTokens > 0
+						? h('span', { title: String(session.contextTokens), style: { fontSize: '10px', color: session.contextTokens > 100000 ? C.warn : C.dimmer } }, t('fleet.contextTokens', { v: formatTokens(session.contextTokens) }))
+						: null,
 					session.outbox !== undefined && session.outbox.dead > 0
 						? h(Button, { compact: true, onClick: () => props.onOp({ op: 'outbox.retry', targetSessionId: session.sessionId }) }, `${t('fleet.outboxDead', { n: session.outbox.dead })} ↻`)
 						: null),
@@ -2110,7 +2124,8 @@ window.__ModuleLoader__.load({
 					h(Chip, { color: fleet.hops >= maxHops ? C.error : C.dim }, `${t('fleet.hops')} ${fleet.hops}/${maxHops}`),
 					h('span', { style: { flex: 1 } }),
 					deadTotal > 0 ? h('span', { style: { fontSize: '10px', color: C.error } }, t('fleet.outboxDead', { n: deadTotal })) : null,
-					h(Button, { compact: true, disabled: props.busy, onClick: () => props.onOp({ op: 'reset-hops' }) }, t('fleet.resetHops'))),
+					h(Button, { compact: true, disabled: props.busy, onClick: () => props.onOp({ op: 'reset-hops' }) }, t('fleet.resetHops')),
+					h(Button, { compact: true, danger: true, disabled: props.busy, onClick: () => props.onOp({ op: 'stop' }) }, t('fleet.stopAll'))),
 				h('div', { style: { display: 'flex', gap: '5px', flexWrap: 'wrap' } },
 					h('input', {
 						value: sessionIdInput,

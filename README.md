@@ -99,7 +99,7 @@ node test/offline-check.mjs      # Host module against a mock Cordis context
 node test/client-apply-check.mjs # client activation against a mock loader/context
 ```
 
-The Host check runs twenty scenarios: boundary guard, branching, loops (including the iteration cap), checkpoint, command step, attachments, package round-trip, validation guards, mention catalogs and inline command lines, the natural-language judge, fan-out aggregation with a failing lane, early k-of-n collection, fan-out timeout, stop-cancels-fan-out, loop re-fan-out, outbox delivery with fleet CRUD, backoff/dead-letter/revive ordering, wait-idle, wait-marker, and the hop cap with the change-attribution block. The client check emulates the browser module loader and confirms `apply` registers the tab type, the tab body and the sidebar entry.
+The Host check runs twenty-two scenarios: boundary guard, branching, loops (including the iteration cap), checkpoint, command step, attachments, package round-trip, validation guards, mention catalogs and inline command lines, the natural-language judge, fan-out aggregation with a failing lane, early k-of-n collection, fan-out timeout, stop-cancels-fan-out, loop re-fan-out, outbox delivery with fleet CRUD, backoff/dead-letter/revive ordering, wait-idle, wait-marker, the hop cap with the change-attribution block, fleet.stop idempotence, and the shipped report-protocol package. The client check emulates the browser module loader and confirms `apply` registers the tab type, the tab body and the sidebar entry.
 
 ### Updating a running install
 

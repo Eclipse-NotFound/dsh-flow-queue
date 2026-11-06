@@ -2469,6 +2469,7 @@ export function apply(ctx, config = {}) {
 						try {
 							const fleet = await ensureFleet(await fleetKeyOf(sessionId));
 							const agents = ctx.get('agents');
+							const tokenMeter = ctx.get('tokenMeter');
 							const sessionViews = [];
 							for (const entry of fleet.sessions) {
 								const agent = agents === undefined ? undefined : agents.get(entry.sessionId);
@@ -2483,12 +2484,26 @@ export function apply(ctx, config = {}) {
 								} catch {
 									/* keep the zero summary */
 								}
-								sessionViews.push({
+								// Context-surface estimate (tokenMeter.measure), not a
+								// cost meter: a big number here is the "this role's
+								// conversation is rotting" early warning.
+								let contextTokens;
+								if (tokenMeter !== undefined && typeof tokenMeter.measure === 'function' && agent !== undefined && agent.session !== undefined) {
+									try {
+										const measurement = tokenMeter.measure(agent.session);
+										if (measurement !== undefined && Number.isFinite(measurement.totalTokens)) contextTokens = measurement.totalTokens;
+									} catch {
+										/* the badge is optional */
+									}
+								}
+								const view = {
 									...entry,
 									agentStatus: agent === undefined ? 'offline' : agent.status === 'running' ? 'running' : 'idle',
 									lastTurnEndAt: seen === undefined ? 0 : seen.lastTurnEndAt,
 									outbox,
-								});
+								};
+								if (contextTokens !== undefined) view.contextTokens = contextTokens;
+								sessionViews.push(view);
 							}
 							writeJson(res, 200, { ok: true, value: { fleet, sessions: sessionViews, maxHops: maxCommHops } });
 						} catch (error) {
@@ -2568,6 +2583,44 @@ export function apply(ctx, config = {}) {
 								}
 								return writeJson(res, 200, { ok: true, value: { revived } });
 							}
+							case 'stop': {
+								// Fleet-wide emergency stop: pause every live run
+								// (cancelling fan-outs and waits) and cancel every
+								// pending delivery. Idempotent by construction.
+								let paused = 0;
+								for (const graph of graphs.values()) {
+									if (graph.run.state !== 'running' && graph.run.state !== 'waiting') continue;
+									cancelDispatches(graph);
+									cancelWaits(graph);
+									graph.run.state = 'paused';
+									graph.run.message = 'fleet stopped';
+									graph.run.waitingNode = null;
+									graph.run.waitingJudge = null;
+									void persist(graph.sessionId, graph);
+									paused += 1;
+								}
+								let cleared = 0;
+								let files = [];
+								try {
+									files = await readdir(outboxDir);
+								} catch {
+									files = [];
+								}
+								for (const name of files) {
+									if (!name.endsWith('.jsonl')) continue;
+									const target = name.slice(0, -'.jsonl'.length);
+									const entries = await readOutbox(target);
+									let dirty = false;
+									for (const entry of entries) {
+										if (entry.status !== 'pending') continue;
+										entry.status = 'cancelled';
+										dirty = true;
+										cleared += 1;
+									}
+									if (dirty) await writeOutbox(target, entries);
+								}
+								return writeJson(res, 200, { ok: true, value: { paused, cleared } });
+							}
 							default:
 								throw fail('invalid-command', 'unknown op');
 						}
@@ -2581,6 +2634,41 @@ export function apply(ctx, config = {}) {
 			}),
 		'dsh-flow-queue: fleet route',
 	);
+
+	// The report protocol ships as a loadable flow package, not engine logic:
+	// a worker-prompt template that pins the four-state turn-end marker, and
+	// the matching marker wait. Written once ('wx'), never overwritten — an
+	// edited copy stays edited.
+	void (async () => {
+		try {
+			await mkdir(packageDir, { recursive: true });
+			const promptId = newId();
+			const waitId = newId();
+			const body = {
+				version: STORE_VERSION,
+				id: 'report-protocol',
+				name: '报告协议（四态标记）',
+				description: 'worker 提示词模板：轮末输出 [[FLOW:REPORT waiting|ready|blocked|failed]]＋摘要；后接等标记的 wait 步骤。载入后把 wait 的目标选成编制里的 worker 会话。',
+				createdAt: 0,
+				entry: promptId,
+				nodes: [
+					{
+						id: promptId,
+						kind: 'prompt',
+						x: 40,
+						y: 40,
+						text: '【任务】\n（在这里写下这个 worker 要做的事）\n\n【报告纪律】每轮结束的最后一行必须输出且只输出一行报告标记：\n[[FLOW:REPORT waiting]] 继续工作中\n[[FLOW:REPORT ready]] 已完成，待审阅\n[[FLOW:REPORT blocked]] 被阻塞，需要人或其他会话介入\n[[FLOW:REPORT failed]] 失败，说明原因\n标记后跟一句中文摘要。',
+					},
+					{ id: waitId, kind: 'wait', x: 40, y: 200, targetRef: '', until: 'marker', marker: '[[FLOW:REPORT ready]]', timeoutMs: WAIT_DEFAULT_TIMEOUT_MS },
+				],
+				edges: [{ id: newId('e'), from: promptId, port: 'next', to: waitId }],
+			};
+			await writeFile(path.join(packageDir, 'report-protocol.json'), JSON.stringify(body, null, '\t'), { encoding: 'utf8', flag: 'wx' });
+		} catch {
+			/* already present, or the package dir is read-only: either way the
+			   library simply lists what is on disk */
+		}
+	})();
 
 	//#endregion
 }

@@ -1,6 +1,6 @@
 {
   "name": "dsh-flow-queue",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Visual flow editor for DeepSeek Harness: draw prompts, model switches, commands, condition branches, loops, checkpoints and subagent fan-outs as one graph; every step runs only at a turn boundary, so an in-flight request and its retries keep their model.",
   "type": "module",
   "main": "./index.js",

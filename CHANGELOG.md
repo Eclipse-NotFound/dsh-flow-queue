@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## 0.7.0 — 2026-11-06
+
+- **Stop fleet**: one button on the fleet header pauses every live run (cancelling in-flight fan-outs and waits) and cancels every pending delivery; idempotent, returns what it stopped.
+- **Context badges**: each fleet session shows its context-surface estimate (`tokenMeter.measure`) — a cheap early warning for "this role's conversation is rotting", not a cost meter.
+- The **report protocol ships as a flow package** (`report-protocol`), not engine logic: a worker-prompt template pinning the four-state turn-end marker (`[[FLOW:REPORT waiting|ready|blocked|failed]]`) and the matching marker wait. Written once, never overwritten — an edited copy stays edited.
+- Tests: two new scenarios (fleet.stop pauses a live run and is idempotent; the report package is present and loads with its wait wired to the ready marker), 22 in total.
+
 ## 0.6.0 — 2026-11-06
 
 - The panel is now two layers. A **Fleet** view (L0) lists the workspace's collaborating sessions as cards — busy light, role, last turn, per-target outbox state — with send/wait edges between them and drill-down into any session's own flow; the header toggles **Flow / Fleet**, and a drilled-in flow shows a `‹ Fleet` breadcrumb.
