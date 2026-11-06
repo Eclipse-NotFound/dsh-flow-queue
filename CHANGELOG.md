@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## 0.5.0 — 2026-11-06
+
+- New step type `Fan-out`: one shared prompt goes to up to 8 throwaway subagents through the in-process `spawn` backend. Each lane may force its own provider/model/reasoning effort (passed as the child's `agentOptions`); an empty lane inherits the session route. Collection is `all`, `k-of-n` (cancel the stragglers once k finish) or `first`; each lane's output is aggregated into the flow outcome, so the next branch, judge or loop reads one document.
+- The parent Session's turn is untouched: completion arrives through each activation's own result promise, so the fan-out waits beside the turn boundary rather than inside a request — the plugin's one invariant holds for subagents exactly as for prompts.
+- Lane state shows on the card as chips (pending / running / done / failed / timed out / cancelled / interrupted). A single failing lane does not fail the step; only "no lane finished" does (`dispatch-failed`). The whole step has one timeout (15 s–30 min, default 10 min), and `Stop` cancels every in-flight lane (`dispatch-stopped`).
+- Tests: five new Host scenarios — fan-out aggregation with one failing lane, early k-of-n collection with straggler cancellation, timeout, stop-cancels-in-flight, and a loop that re-fans-out every iteration.
+
 ## 0.4.0 — 2026-11-06
 
 - Branch and loop conditions gain a `model judges` type: a natural-language condition such as "latency is below 10ms". Reaching the step starts exactly one minimal judge turn — roughly 40 instruction tokens plus the condition verbatim — and the model answers YES or NO on the first reply line; the engine parses that line and nothing else. The verdict (with a reason excerpt) shows on the card, `negate` applies, a reply without YES/NO fails the step as `no-decision`, and a loop re-judges fresh on every iteration. No tool is registered — a link-installed package cannot import the tool DSL, and a global judge tool would sit in every session's schema — so the prompt table of every session stays untouched.

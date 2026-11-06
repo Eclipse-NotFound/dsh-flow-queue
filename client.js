@@ -21,7 +21,7 @@ window.__ModuleLoader__.load({
 		const PORT_GAP = 22;
 		// Keep in sync with package.json. Shown in the panel footer so the page's
 		// running build is identifiable at a glance during remote diagnosis.
-		const CLIENT_VERSION = '0.4.0';
+		const CLIENT_VERSION = '0.5.0';
 
 		let localeSvc = null;
 		let pluginCtx = null;
@@ -62,6 +62,24 @@ window.__ModuleLoader__.load({
 				'kind.branch': '条件分支',
 				'kind.loop': '循环',
 				'kind.checkpoint': '断点',
+				'kind.dispatch': '扇出子代理',
+				'collect.all': '全部完成',
+				'collect.kOfN': '前 k 个完成',
+				'collect.first': '首个完成',
+				'inspector.targets': '子代理目标（最多 8 路）',
+				'inspector.addTarget': '加一路',
+				'inspector.targetLabel': '标签',
+				'inspector.collect': '聚合方式',
+				'inspector.k': 'k（前几个完成即收）',
+				'inspector.timeout': '总超时（秒）',
+				'inspector.dispatchText': '同题提示词（发给每一路）',
+				'child.pending': '等待',
+				'child.running': '运行中',
+				'child.done': '完成',
+				'child.failed': '失败',
+				'child.timeout': '超时',
+				'child.cancelled': '已取消',
+				'child.interrupted': '已中断',
 				'status.idle': '待运行',
 				'status.running': '执行中',
 				'status.completed': '完成',
@@ -137,6 +155,8 @@ window.__ModuleLoader__.load({
 				'error.code.no-decision': '判定轮没有在首行回答 YES 或 NO',
 				'error.code.interrupted': 'Harness 重启中断了这一步',
 				'error.code.dispatch-failed': '派发失败',
+				'error.code.no-subagents': '当前环境没有可用的子代理服务',
+				'error.code.dispatch-stopped': '运行被停止，扇出未全部完成',
 				'error.code.turn-error': '这一轮出错',
 				'error.code.turn-aborted': '这一轮被中止',
 				'error.code.turn-interrupted': '这一轮被中断',
@@ -183,6 +203,24 @@ window.__ModuleLoader__.load({
 				'kind.branch': 'Branch',
 				'kind.loop': 'Loop',
 				'kind.checkpoint': 'Checkpoint',
+				'kind.dispatch': 'Fan-out',
+				'collect.all': 'wait for all',
+				'collect.kOfN': 'first k done',
+				'collect.first': 'first done',
+				'inspector.targets': 'Subagent targets (max 8)',
+				'inspector.addTarget': 'Add lane',
+				'inspector.targetLabel': 'Label',
+				'inspector.collect': 'Collect',
+				'inspector.k': 'k (first k done)',
+				'inspector.timeout': 'Total timeout (s)',
+				'inspector.dispatchText': 'Shared prompt (sent to every lane)',
+				'child.pending': 'pending',
+				'child.running': 'running',
+				'child.done': 'done',
+				'child.failed': 'failed',
+				'child.timeout': 'timed out',
+				'child.cancelled': 'cancelled',
+				'child.interrupted': 'interrupted',
 				'status.idle': 'Pending',
 				'status.running': 'Running',
 				'status.completed': 'Done',
@@ -258,6 +296,8 @@ window.__ModuleLoader__.load({
 				'error.code.no-decision': 'The judge turn did not answer YES or NO on its first line',
 				'error.code.interrupted': 'A Harness restart interrupted this step',
 				'error.code.dispatch-failed': 'Dispatch failed',
+				'error.code.no-subagents': 'The subagents service is unavailable in this profile',
+				'error.code.dispatch-stopped': 'Stopped before the fan-out settled',
 				'error.code.turn-error': 'This turn failed',
 				'error.code.turn-aborted': 'This turn was aborted',
 				'error.code.turn-interrupted': 'This turn was interrupted',
@@ -289,6 +329,7 @@ window.__ModuleLoader__.load({
 
 		const KIND_COLOR = {
 			prompt: C.accent,
+			dispatch: C.accent,
 			model: C.success,
 			command: C.warn,
 			branch: C.warn,
@@ -296,7 +337,16 @@ window.__ModuleLoader__.load({
 			checkpoint: C.dim,
 		};
 
-		const KIND_ORDER = ['prompt', 'model', 'command', 'branch', 'loop', 'checkpoint'];
+		const KIND_ORDER = ['prompt', 'dispatch', 'model', 'command', 'branch', 'loop', 'checkpoint'];
+		const CHILD_COLOR = {
+			pending: C.dimmer,
+			running: C.accent,
+			done: C.success,
+			failed: C.error,
+			timeout: C.warn,
+			cancelled: C.dimmer,
+			interrupted: C.dimmer,
+		};
 		const PORT_LABEL = { next: 'port.next', yes: 'port.yes', no: 'port.no', again: 'port.again', exit: 'port.exit' };
 		const CONDITION_TYPES = ['always', 'regex', 'contains', 'marker', 'tool-failed', 'last-failed', 'judge'];
 
@@ -555,6 +605,14 @@ window.__ModuleLoader__.load({
 			}
 			if (node.kind === 'command') return node.command || t('kind.command');
 			if (node.kind === 'checkpoint') return node.note || t('kind.checkpoint');
+			if (node.kind === 'dispatch') {
+				const targets = Array.isArray(node.targets) ? node.targets.length : 0;
+				const collect = node.collect === 'first'
+					? t('collect.first')
+					: node.collect === 'k-of-n' ? `${t('collect.kOfN')} k=${node.k || 1}` : t('collect.all');
+				const head = (typeof node.text === 'string' ? node.text.trim() : '').split('\n')[0].slice(0, 56);
+				return `${targets} 路 · ${collect}${head === '' ? '' : ` · ${head}`}`;
+			}
 			if (node.kind === 'branch' || node.kind === 'loop') {
 				const type = node.condition === undefined ? 'always' : node.condition.type;
 				const base = `${t(`cond.${type}`)}${node.condition && node.condition.value ? ` · ${node.condition.value}` : ''}`;
@@ -705,6 +763,33 @@ window.__ModuleLoader__.load({
 					node.usedModel ? h('span', { style: { fontSize: '10px', color: C.dimmer, maxWidth: '88px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: node.usedModel }, node.usedModel) : null,
 				),
 				h('div', { style: bodyStyle }, body || h('span', { style: { color: C.dimmer } }, '—')),
+			node.kind === 'dispatch' && Array.isArray(node.children) && node.children.length > 0
+				? h(
+					'div',
+					{ style: { display: 'flex', flexWrap: 'wrap', gap: '3px', padding: '0 9px 7px' } },
+					node.children.slice(0, 8).map((child, index) =>
+						h(
+							'span',
+							{
+								key: `child-${index}`,
+								title: child.summary === '' ? child.label : child.summary,
+								style: {
+									fontSize: '10px',
+									lineHeight: '15px',
+									padding: '0 6px',
+									borderRadius: '999px',
+									border: `1px solid ${CHILD_COLOR[child.status] || C.dimmer}`,
+									color: CHILD_COLOR[child.status] || C.dimmer,
+									maxWidth: '100%',
+									overflow: 'hidden',
+									textOverflow: 'ellipsis',
+									whiteSpace: 'nowrap',
+								},
+							},
+							`${child.label} ${t(`child.${child.status}`)}`,
+						)),
+				)
+				: null,
 				node.error
 					? h('div', { style: { padding: '0 9px 7px', fontSize: '11px', lineHeight: '15px', color: C.error } }, errorText(t, node.error))
 					: null,
@@ -1371,6 +1456,85 @@ window.__ModuleLoader__.load({
 			);
 		}
 
+		/** Target list editor for a fan-out step: label, model route, effort. */
+		function DispatchTargets(props) {
+			const t = props.t;
+			const node = props.node;
+			const targets = Array.isArray(node.targets) ? node.targets : [];
+			const [labels, setLabels] = useState(() => targets.map((item) => item.label));
+			useEffect(() => {
+				setLabels(targets.map((item) => item.label));
+			}, [node.id, targets.length]);
+
+			const commit = (next) => props.onPatch({ targets: next });
+			const setTarget = (index, change) => {
+				const next = targets.map((item, i) => (i === index ? { ...item, ...change } : item));
+				commit(next);
+			};
+
+			const rows = targets.map((target, index) =>
+				h(
+					'div',
+					{
+						key: `target-${index}`,
+						style: { border: `1px solid ${C.border}`, borderRadius: '7px', padding: '6px 7px', display: 'flex', flexDirection: 'column', gap: '5px' },
+					},
+					h('div', { style: { display: 'flex', gap: '5px', alignItems: 'center' } },
+						h('input', {
+							value: labels[index] === undefined ? target.label : labels[index],
+							placeholder: t('inspector.targetLabel'),
+							style: { ...inputStyle, flex: 1, minWidth: 0 },
+							onChange: (event) => {
+								const next = labels.slice();
+								next[index] = event.target.value;
+								setLabels(next);
+							},
+							onBlur: () => setTarget(index, { label: labels[index] === undefined ? target.label : labels[index] }),
+						}),
+						h(Button, {
+							compact: true,
+							title: t('action.delete'),
+							onClick: () => commit(targets.filter((_, i) => i !== index)),
+						}, '×')),
+					h(ModelSelect, {
+						catalog: props.catalog,
+						allowEmpty: true,
+						effort: target.reasoningEffort,
+						value: target.provider !== '' && target.model !== '' ? `${target.provider}\u0000${target.model}` : '',
+						onChange: (selection) => {
+							if (selection === undefined) setTarget(index, { provider: '', model: '', reasoningEffort: '' });
+							else setTarget(index, {
+								provider: selection.provider,
+								model: selection.model,
+								reasoningEffort: selection.reasoningEffort === undefined || selection.reasoningEffort === null ? '' : selection.reasoningEffort,
+							});
+						},
+					}),
+					h(EffortSelect, {
+						t,
+						catalog: props.catalog,
+						provider: target.provider === '' ? undefined : target.provider,
+						model: target.model === '' ? undefined : target.model,
+						value: target.reasoningEffort === '' ? undefined : target.reasoningEffort,
+						onChange: (effort) => setTarget(index, { reasoningEffort: effort === null || effort === undefined ? '' : effort }),
+					}),
+				));
+			return h(
+				'div',
+				{ style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+				...rows,
+				h(Button, {
+					compact: true,
+					disabled: targets.length >= 8,
+					onClick: () => {
+						const next = targets.map((item) => ({ ...item }));
+						next.push({ label: `${next.length + 1}`, provider: '', model: '', reasoningEffort: '' });
+						commit(next);
+					},
+				}, `+${t('inspector.addTarget')}`),
+			);
+		}
+
 		function Inspector(props) {
 			const t = props.t;
 			const node = props.node;
@@ -1491,6 +1655,54 @@ window.__ModuleLoader__.load({
 						style: inputStyle,
 						onChange: (event) => setCommand(event.target.value),
 						onBlur: () => patch({ command }),
+					})));
+			}
+
+			if (node.kind === 'dispatch') {
+				rows.push(h(Field, { key: 'dtext', label: t('inspector.dispatchText') },
+					h(PromptEditor, {
+						t,
+						sessionId: props.sessionId,
+						value: text,
+						onChangeText: setText,
+						onCommit: () => patch({ text }),
+					})));
+				rows.push(h(Field, { key: 'targets', label: t('inspector.targets') },
+					h(DispatchTargets, {
+						t,
+						node,
+						catalog: props.catalog,
+						onPatch: (change) => props.onPatch(node.id, change),
+					})));
+				rows.push(h(Field, { key: 'collect', label: t('inspector.collect') },
+					h('select', {
+						value: node.collect === 'k-of-n' || node.collect === 'first' ? node.collect : 'all',
+						style: inputStyle,
+						onChange: (event) => patch({ collect: event.target.value }),
+					},
+					h('option', { value: 'all' }, t('collect.all')),
+					h('option', { value: 'k-of-n' }, t('collect.kOfN')),
+					h('option', { value: 'first' }, t('collect.first')))));
+				if (node.collect === 'k-of-n') {
+					const total = Array.isArray(node.targets) ? node.targets.length : 1;
+					rows.push(h(Field, { key: 'k', label: t('inspector.k') },
+						h('input', {
+							type: 'number',
+							min: 1,
+							max: Math.max(total, 1),
+							value: node.k || 1,
+							style: inputStyle,
+							onChange: (event) => patch({ k: Number(event.target.value) || 1 }),
+						})));
+				}
+				rows.push(h(Field, { key: 'timeout', label: t('inspector.timeout') },
+					h('input', {
+						type: 'number',
+						min: 15,
+						max: 1800,
+						value: Math.round((node.timeoutMs || 600000) / 1000),
+						style: inputStyle,
+						onChange: (event) => patch({ timeoutMs: (Number(event.target.value) || 600) * 1000 }),
 					})));
 			}
 

@@ -33,9 +33,17 @@ const MAX_ATTACHMENTS_PER_NODE = 8;
 const DISPATCH_WATCHDOG_MS = 30000;
 const SETTLE_MS = 80;
 const MAX_LOOP_EXECUTIONS = 500;
+const MAX_DISPATCH_TARGETS = 8;
+const DISPATCH_MIN_TIMEOUT_MS = 15000;
+const DISPATCH_MAX_TIMEOUT_MS = 1800000;
+const DISPATCH_DEFAULT_TIMEOUT_MS = 600000;
+// Tests drive the timeout path with a much lower floor; production keeps 15 s.
+let dispatchMinTimeoutMs = DISPATCH_MIN_TIMEOUT_MS;
+const DISPATCH_CHILD_STATUSES = new Set(['pending', 'running', 'done', 'failed', 'timeout', 'cancelled', 'interrupted']);
+const DISPATCH_COLLECT_MODES = new Set(['all', 'k-of-n', 'first']);
 
 const NODE_STATUSES = new Set(['idle', 'running', 'completed', 'failed', 'skipped', 'waiting']);
-const NODE_KINDS = new Set(['prompt', 'model', 'command', 'checkpoint', 'branch', 'loop']);
+const NODE_KINDS = new Set(['prompt', 'model', 'command', 'checkpoint', 'branch', 'loop', 'dispatch']);
 const PORTS = {
 	prompt: ['next'],
 	model: ['next'],
@@ -43,6 +51,7 @@ const PORTS = {
 	checkpoint: ['next'],
 	branch: ['yes', 'no'],
 	loop: ['again', 'exit'],
+	dispatch: ['next'],
 };
 const CONDITION_TYPES = new Set(['always', 'regex', 'contains', 'marker', 'tool-failed', 'last-failed', 'judge']);
 
@@ -163,6 +172,25 @@ function emptyGraph(sessionId) {
 	};
 }
 
+function normalizeDispatchTargets(input) {
+	if (!Array.isArray(input) || input.length === 0) {
+		return [{ label: 'A', provider: '', model: '', reasoningEffort: '' }];
+	}
+	const targets = input
+		.slice(0, MAX_DISPATCH_TARGETS)
+		.map((item) => {
+			if (item === null || typeof item !== 'object') return undefined;
+			return {
+				label: typeof item.label === 'string' && item.label.trim() !== '' ? item.label.trim().slice(0, 80) : 'model',
+				provider: typeof item.provider === 'string' ? item.provider.slice(0, MAX_IDENT_CHARS) : '',
+				model: typeof item.model === 'string' ? item.model.slice(0, MAX_IDENT_CHARS) : '',
+				reasoningEffort: typeof item.reasoningEffort === 'string' ? item.reasoningEffort.slice(0, 64) : '',
+			};
+		})
+		.filter((item) => item !== undefined);
+	return targets.length > 0 ? targets : [{ label: 'A', provider: '', model: '', reasoningEffort: '' }];
+}
+
 function normalizeNode(input) {
 	if (input === null || typeof input !== 'object' || !NODE_KINDS.has(input.kind)) return undefined;
 	const kind = input.kind;
@@ -224,6 +252,32 @@ function normalizeNode(input) {
 			node.maxIterations = Math.min(Math.max(max, 1), 100);
 			break;
 		}
+		case 'dispatch': {
+			node.text = typeof input.text === 'string' ? input.text.slice(0, MAX_PROMPT_CHARS) : '';
+			node.targets = normalizeDispatchTargets(input.targets);
+			node.collect = DISPATCH_COLLECT_MODES.has(input.collect) ? input.collect : 'all';
+			const total = Math.max(node.targets.length, 1);
+			node.k = Number.isFinite(input.k) ? Math.min(Math.max(Math.round(input.k), 1), total) : 1;
+			if (node.collect === 'first') node.k = 1;
+			const timeout = Number.isFinite(input.timeoutMs) ? Math.round(input.timeoutMs) : DISPATCH_DEFAULT_TIMEOUT_MS;
+			node.timeoutMs = Math.min(Math.max(timeout, dispatchMinTimeoutMs), DISPATCH_MAX_TIMEOUT_MS);
+			if (Array.isArray(input.children)) {
+				node.children = input.children
+					.slice(0, MAX_DISPATCH_TARGETS)
+					.map((child) => {
+						if (child === null || typeof child !== 'object') return undefined;
+						return {
+							label: typeof child.label === 'string' ? child.label.slice(0, 80) : '',
+							provider: typeof child.provider === 'string' ? child.provider.slice(0, MAX_IDENT_CHARS) : '',
+							model: typeof child.model === 'string' ? child.model.slice(0, MAX_IDENT_CHARS) : '',
+							status: DISPATCH_CHILD_STATUSES.has(child.status) ? child.status : 'pending',
+							summary: typeof child.summary === 'string' ? child.summary.slice(0, 600) : '',
+						};
+					})
+					.filter((child) => child !== undefined);
+			}
+			break;
+		}
 		default:
 			break;
 	}
@@ -258,11 +312,15 @@ function normalizeEdge(input) {
 
 export function apply(ctx, config = {}) {
 	const baseDir = resolveBaseDir(config);
+	if (Number.isFinite(config.dispatchMinTimeoutMs)) {
+		dispatchMinTimeoutMs = Math.max(50, Math.round(config.dispatchMinTimeoutMs));
+	}
 	const graphDir = path.join(baseDir, 'sessions');
 	const packageDir = path.join(baseDir, 'packages');
 
 	const graphs = new Map();
 	const watchdogs = new Map();
+	const dispatchRuns = new Map();
 	const timers = new Set();
 	const writeChains = new Map();
 
@@ -293,6 +351,8 @@ export function apply(ctx, config = {}) {
 
 	ctx.effect(
 		() => () => {
+			for (const entry of dispatchRuns.values()) entry.abort.abort();
+			dispatchRuns.clear();
 			for (const handle of timers) clearTimeout(handle);
 			timers.clear();
 			watchdogs.clear();
@@ -400,6 +460,11 @@ export function apply(ctx, config = {}) {
 				node.status = 'failed';
 				node.error = fail('interrupted', 'the Harness process restarted while this step was running');
 				if (node.endedAt === undefined) node.endedAt = Date.now();
+			}
+			if (Array.isArray(node.children)) {
+				node.children = node.children.map((child) =>
+					child.status === 'pending' || child.status === 'running' ? { ...child, status: 'interrupted' } : child,
+				);
 			}
 		}
 		return graph;
@@ -614,6 +679,186 @@ export function apply(ctx, config = {}) {
 		return node.condition.negate === true ? !answer : answer;
 	}
 
+	//#region dispatch fan-out
+
+	/**
+	 * Fan one prompt out to N throwaway subagents through the in-process
+	 * `spawn` backend and collect their outputs. Completion arrives through
+	 * each activation's own result promise, so the parent Session's turn is
+	 * never involved — the fan-out step waits beside the turn boundary, it
+	 * never steps across it. A target with provider+model passes them as the
+	 * child's AgentOptions; an empty target inherits the session route.
+	 */
+	async function startDispatch(sessionId, graph, node) {
+		const subagents = ctx.get('subagents');
+		if (subagents === undefined || typeof subagents.startActivation !== 'function') {
+			touchNode(node, 'failed');
+			node.error = fail('no-subagents', 'the subagents service is not available in this profile');
+			return { port: 'next' };
+		}
+		if (typeof subagents.getProvider === 'function' && subagents.getProvider('spawn') === undefined) {
+			touchNode(node, 'failed');
+			node.error = fail('no-subagents', 'the in-process spawn backend is not registered');
+			return { port: 'next' };
+		}
+		const resolved = await ctx.sessionController.resolveAgent(sessionId);
+		if (resolved === undefined || resolved.agent === undefined) {
+			touchNode(node, 'failed');
+			node.error = fail('no-agent', 'the Session could not be resumed');
+			return { port: 'next' };
+		}
+		const text = typeof node.text === 'string' ? node.text.trim() : '';
+		if (text === '') {
+			touchNode(node, 'failed');
+			node.error = fail('empty-prompt', 'this step has no prompt text for the subagents');
+			return { port: 'next' };
+		}
+		touchNode(node, 'running');
+		node.children = node.targets.map((target) => ({
+			label: target.label,
+			provider: target.provider,
+			model: target.model,
+			status: 'pending',
+			summary: '',
+		}));
+		graph.run.waitingNode = node.id;
+		await persist(sessionId, graph);
+
+		const total = node.targets.length;
+		const needed = node.collect === 'first' ? 1 : node.collect === 'k-of-n' ? Math.min(Math.max(node.k ?? 1, 1), total) : total;
+		const abort = new AbortController();
+		const run = { abort, activations: [] };
+		dispatchRuns.set(node.id, run);
+		let settledDone = 0;
+		let settledAll = 0;
+
+		const finish = () => {
+			// dispatchRuns membership is the once-latch: stop, timeout and the
+			// last settle all funnel here, and only the first one runs.
+			if (dispatchRuns.get(node.id) !== run) return;
+			if (run.timeout !== undefined) {
+				clearTimeout(run.timeout);
+				timers.delete(run.timeout);
+			}
+			dispatchRuns.delete(node.id);
+			const children = Array.isArray(node.children) ? node.children : [];
+			const done = children.filter((child) => child.status === 'done');
+			const sections = children.map((child) => {
+				const route = child.provider !== '' && child.model !== '' ? `${child.provider}/${child.model}` : 'inherit';
+				return `## ${child.label} (${route}) ${child.status}\n${child.summary}`;
+			});
+			const ok = done.length > 0;
+			node.result = `${done.length}/${children.length} done`;
+			graph.outcome = { kind: 'dispatch', text: sections.join('\n\n').slice(0, 20000), ok, toolErrors: [] };
+			touchNode(node, ok ? 'completed' : 'failed');
+			if (!ok) node.error = fail('dispatch-failed', 'every subagent failed or timed out');
+			graph.run.waitingNode = null;
+			const next = followEdge(graph, node.id, 'next');
+			if (next === undefined) finishRun(graph, 'done', 'no outgoing connection');
+			else graph.run.cursor = next;
+			void persist(sessionId, graph);
+			if (graph.run.state === 'running') later(() => advance(sessionId), SETTLE_MS);
+		};
+
+		run.timeout = later(() => {
+			if (dispatchRuns.get(node.id) !== run) return;
+			for (const child of node.children) {
+				if (child.status === 'pending' || child.status === 'running') child.status = 'timeout';
+			}
+			void persist(sessionId, graph);
+			finish();
+		}, node.timeoutMs);
+
+		const settle = (index, status, summary) => {
+			if (dispatchRuns.get(node.id) !== run) return;
+			const child = node.children[index];
+			if (child === undefined || (child.status !== 'pending' && child.status !== 'running')) return;
+			child.status = status;
+			child.summary = summary;
+			settledAll += 1;
+			if (status === 'done') settledDone += 1;
+			const satisfied = settledDone >= needed;
+			if (satisfied) {
+				// k-of-n / first: whatever is still in flight is no longer needed.
+				abort.abort();
+				for (const other of node.children) {
+					if (other.status === 'pending' || other.status === 'running') {
+						other.status = 'cancelled';
+						settledAll += 1;
+					}
+				}
+			}
+			void persist(sessionId, graph);
+			if (satisfied || settledAll >= total) finish();
+		};
+
+		for (let index = 0; index < node.targets.length; index += 1) {
+			const target = node.targets[index];
+			const child = node.children[index];
+			const request = { prompt: [{ type: 'text', text }], parent: resolved.agent };
+			if (target.provider !== '' && target.model !== '') {
+				const agentOptions = { provider: target.provider, model: target.model };
+				if (typeof target.reasoningEffort === 'string' && target.reasoningEffort !== '') agentOptions.reasoningEffort = target.reasoningEffort;
+				request.agentOptions = agentOptions;
+			}
+			try {
+				const activation = await subagents.startActivation({
+					provider: 'spawn',
+					label: `${node.title !== undefined ? node.title : 'fan-out'} · ${target.label}`,
+					delivery: 'caller',
+					request,
+					signal: abort.signal,
+				});
+				run.activations.push(activation);
+				child.childId = activation.childId;
+				child.status = 'running';
+				void persist(sessionId, graph);
+				activation.result
+					.then((result) => {
+						const output = result === undefined || result === null ? '' : textOfBlocks(result.output);
+						settle(index, 'done', output.slice(0, 600));
+					})
+					.catch((error) => {
+						settle(index, 'failed', error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300));
+					});
+			} catch (error) {
+				settle(index, 'failed', error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300));
+			}
+		}
+		return { wait: true };
+	}
+
+	/** Cancel every in-flight fan-out of one graph (run.stop and unload paths). */
+	function cancelDispatches(graph) {
+		for (const node of graph.nodes) {
+			if (node.kind !== 'dispatch') continue;
+			const run = dispatchRuns.get(node.id);
+			if (run === undefined) continue;
+			run.abort.abort();
+			for (const activation of run.activations) {
+				try {
+					void activation.dispose();
+				} catch {
+					/* best effort: dispose must never break a stop */
+				}
+			}
+			if (run.timeout !== undefined) {
+				clearTimeout(run.timeout);
+				timers.delete(run.timeout);
+			}
+			dispatchRuns.delete(node.id);
+			for (const child of node.children ?? []) {
+				if (child.status === 'pending' || child.status === 'running') child.status = 'cancelled';
+			}
+			if (node.status === 'running') {
+				touchNode(node, 'failed');
+				node.error = fail('dispatch-stopped', 'the run was stopped before the fan-out settled');
+			}
+		}
+	}
+
+	//#endregion
+
 	function finishRun(graph, state, message) {
 		graph.run.state = state;
 		graph.run.message = message ?? '';
@@ -746,6 +991,18 @@ export function apply(ctx, config = {}) {
 				touchNode(node, 'running');
 				node.result = `第 ${used + 1} 轮`;
 				return { port: 'again' };
+			}
+			case 'dispatch': {
+				// Already fanning out: wait beside the boundary until the
+				// activations settle and move the cursor themselves.
+				if (
+					node.status === 'running'
+					&& Array.isArray(node.children)
+					&& node.children.some((child) => child.status === 'pending' || child.status === 'running')
+				) {
+					return { wait: true };
+				}
+				return startDispatch(sessionId, graph, node);
 			}
 			case 'prompt':
 			default: {
@@ -1041,6 +1298,7 @@ export function apply(ctx, config = {}) {
 				delete copy.usedModel;
 				delete copy.error;
 				delete copy.durationMs;
+				delete copy.children;
 				if (copy.result !== undefined) delete copy.result;
 				return copy;
 			}),
@@ -1117,6 +1375,16 @@ export function apply(ctx, config = {}) {
 		if (typeof patch.note === 'string') node.note = patch.note.slice(0, 500);
 		if (patch.condition !== undefined) node.condition = conditionOf(patch.condition);
 		if (Number.isFinite(patch.maxIterations)) node.maxIterations = Math.min(Math.max(Math.round(patch.maxIterations), 1), 100);
+		if (node.kind === 'dispatch') {
+			if (Array.isArray(patch.targets)) node.targets = normalizeDispatchTargets(patch.targets);
+			if (DISPATCH_COLLECT_MODES.has(patch.collect)) {
+				node.collect = patch.collect;
+				if (patch.collect === 'first') node.k = 1;
+			}
+			const total = Math.max(Array.isArray(node.targets) ? node.targets.length : 1, 1);
+			if (Number.isFinite(patch.k)) node.k = Math.min(Math.max(Math.round(patch.k), 1), total);
+			if (Number.isFinite(patch.timeoutMs)) node.timeoutMs = Math.min(Math.max(Math.round(patch.timeoutMs), dispatchMinTimeoutMs), DISPATCH_MAX_TIMEOUT_MS);
+		}
 		if (patch.provider === null) delete node.provider;
 		else if (typeof patch.provider === 'string') node.provider = patch.provider.slice(0, MAX_IDENT_CHARS);
 		if (patch.model === null) delete node.model;
@@ -1184,6 +1452,10 @@ export function apply(ctx, config = {}) {
 					condition: payload.condition,
 					maxIterations: payload.maxIterations,
 					note: payload.note,
+					targets: payload.targets,
+					collect: payload.collect,
+					k: payload.k,
+					timeoutMs: payload.timeoutMs,
 				});
 				if (node === undefined) throw fail('invalid-node', 'unknown step kind');
 				graph.nodes.push(node);
@@ -1278,6 +1550,7 @@ export function apply(ctx, config = {}) {
 					delete node.turn;
 					delete node.result;
 					delete node.judge;
+					delete node.children;
 				}
 				await persist(sessionId, graph);
 				return { state: publicState(graph) };
@@ -1329,6 +1602,7 @@ export function apply(ctx, config = {}) {
 				return { state: publicState(graph) };
 			}
 			case 'run.stop': {
+				cancelDispatches(graph);
 				graph.run.state = 'idle';
 				graph.run.cursor = null;
 				graph.run.waitingNode = null;

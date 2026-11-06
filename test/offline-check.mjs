@@ -41,12 +41,12 @@ async function waitFor(predicate, label, timeoutMs = 5000) {
 	}
 }
 
-async function makeHarness() {
+async function makeHarness(options = {}) {
 	const stateDir = await mkdtemp(path.join(tmpdir(), 'flow-queue-'));
 	const routes = new Map();
 	const listeners = new Map();
-	const calls = { selectModel: [], prompt: [], command: [] };
-	const world = { agentStatus: 'idle', agentLive: true, routes, listeners, calls, stateDir };
+	const calls = { selectModel: [], prompt: [], command: [], startActivation: [] };
+	const world = { agentStatus: 'idle', agentLive: true, routes, listeners, calls, stateDir, children: {} };
 
 	const ctx = {
 		effect(run) {
@@ -122,6 +122,31 @@ async function makeHarness() {
 					},
 				};
 			}
+			if (name === 'subagents') {
+				return {
+					getProvider(id) {
+						return world.subagentsEnabled === false ? undefined : { name: id };
+					},
+					startActivation(spec) {
+						calls.startActivation.push(spec);
+						if (world.activationFailure === true) throw new Error('spawn refused');
+						const childId = `child-${calls.startActivation.length}`;
+						const preset = world.children[childId] ?? { delay: 5, output: `output ${childId}` };
+						const result = new Promise((resolve, reject) => {
+							setTimeout(() => {
+								if (preset.reject !== undefined) reject(new Error(preset.reject));
+								else resolve({ output: [{ type: 'text', text: preset.output ?? '' }], stopReason: 'completed' });
+							}, preset.delay ?? 5);
+						});
+						return Promise.resolve({
+							childId,
+							messageId: 'msg-1',
+							result,
+							dispose: async () => {},
+						});
+					},
+				};
+			}
 			return undefined;
 		},
 		webServer: {
@@ -149,7 +174,7 @@ async function makeHarness() {
 		},
 	};
 
-	apply(ctx, { stateDir });
+	apply(ctx, { stateDir, ...options });
 
 	function emit(name, ...args) {
 		for (const handler of listeners.get(name) ?? []) handler(...args);
@@ -603,6 +628,179 @@ async function cleanup(harness) {
 	snapshot = await waitForState(h, (value) => value.run.state === 'error', 'the unparsable judge to fail');
 	assert.equal(snapshot.run.message, 'no-decision');
 	assert.equal(snapshot.nodes.find((node) => node.id === gate.node.id).error.code, 'no-decision');
+
+	await cleanup(h);
+}
+
+//#endregion
+
+//#region scenario 11: a fan-out runs every target as a subagent and aggregates
+
+{
+	const h = await makeHarness();
+	h.world.children = {
+		'child-1': { delay: 10, output: 'idea A' },
+		'child-2': { delay: 20, reject: 'boom' },
+		'child-3': { delay: 5, output: 'idea C' },
+	};
+	const fan = await h.command({
+		op: 'node.add',
+		kind: 'dispatch',
+		text: 'brainstorm the naming',
+		targets: [
+			{ label: 'A', provider: 'p', model: 'a' },
+			{ label: 'B', provider: 'p', model: 'b' },
+			{ label: 'C', provider: 'p', model: 'c' },
+		],
+		collect: 'all',
+	});
+	const after = await h.command({ op: 'node.add', kind: 'model', provider: 'next', model: 'm' });
+	await h.command({ op: 'edge.add', from: fan.node.id, port: 'next', to: after.node.id });
+
+	await h.command({ op: 'run.start' });
+	await waitForState(h, (value) => value.run.state === 'done', 'the fan-out flow to settle');
+	const snapshot = await h.state();
+	const node = snapshot.nodes.find((candidate) => candidate.id === fan.node.id);
+	assert.equal(h.world.calls.startActivation.length, 3, 'one child per target');
+	assert.equal(h.world.calls.startActivation[0].provider, 'spawn', 'the in-process spawn backend is used');
+	assert.deepEqual(h.world.calls.startActivation[0].request.agentOptions, { provider: 'p', model: 'a' }, 'the per-child route is passed');
+	assert.equal(h.world.calls.startActivation[0].request.prompt[0].text, 'brainstorm the naming', 'every child gets the same prompt');
+	assert.equal(node.status, 'completed');
+	assert.equal(node.result, '2/3 done');
+	assert.equal(node.children[0].status, 'done');
+	assert.equal(node.children[1].status, 'failed');
+	assert.equal(node.children[2].status, 'done');
+	assert.equal(snapshot.outcome.kind, 'dispatch');
+	assert.ok(snapshot.outcome.text.includes('idea A'));
+	assert.ok(snapshot.outcome.text.includes('idea C'));
+	assert.equal(h.world.calls.selectModel.length, 1, 'the next step runs once');
+
+	await cleanup(h);
+}
+
+//#endregion
+
+//#region scenario 12: k-of-n collects early and cancels the rest
+
+{
+	const h = await makeHarness();
+	h.world.children = {
+		'child-1': { delay: 5, output: 'quick A' },
+		'child-2': { delay: 5, output: 'quick B' },
+		'child-3': { delay: 400, output: 'slow C' },
+	};
+	const fan = await h.command({
+		op: 'node.add',
+		kind: 'dispatch',
+		text: 'vote',
+		targets: [
+			{ label: 'A', provider: 'p', model: 'a' },
+			{ label: 'B', provider: 'p', model: 'b' },
+			{ label: 'C', provider: 'p', model: 'c' },
+		],
+		collect: 'k-of-n',
+		k: 2,
+	});
+	await h.command({ op: 'run.start' });
+	const snapshot = await waitForState(h, (value) => value.run.state === 'done', 'the k-of-n flow to settle');
+	const node = snapshot.nodes.find((candidate) => candidate.id === fan.node.id);
+	assert.equal(node.status, 'completed');
+	assert.equal(node.children[2].status, 'cancelled', 'the straggler is cancelled once k children are done');
+	assert.equal(node.children.filter((child) => child.status === 'done').length, 2);
+	assert.equal(node.result, '2/3 done');
+
+	await cleanup(h);
+}
+
+//#endregion
+
+//#region scenario 13: a fan-out timeout marks stragglers and fails when none finish
+
+{
+	const h = await makeHarness({ dispatchMinTimeoutMs: 200 });
+	h.world.children = {
+		'child-1': { delay: 800, output: 'too late' },
+		'child-2': { delay: 800, output: 'too late' },
+	};
+	const fan = await h.command({
+		op: 'node.add',
+		kind: 'dispatch',
+		text: 'slow question',
+		targets: [
+			{ label: 'A', provider: 'p', model: 'a' },
+			{ label: 'B', provider: 'p', model: 'b' },
+		],
+		collect: 'all',
+		timeoutMs: 300,
+	});
+	await h.command({ op: 'run.start' });
+	const snapshot = await waitForState(h, (value) => value.run.state === 'done', 'the timed-out flow to settle');
+	const node = snapshot.nodes.find((candidate) => candidate.id === fan.node.id);
+	assert.equal(node.status, 'failed');
+	assert.equal(node.error.code, 'dispatch-failed');
+	assert.equal(node.children[0].status, 'timeout');
+	assert.equal(node.children[1].status, 'timeout');
+
+	await cleanup(h);
+}
+
+//#endregion
+
+//#region scenario 14: stopping the run cancels an in-flight fan-out
+
+{
+	const h = await makeHarness();
+	h.world.children = {
+		'child-1': { delay: 5000, output: 'never' },
+		'child-2': { delay: 5000, output: 'never' },
+	};
+	const fan = await h.command({
+		op: 'node.add',
+		kind: 'dispatch',
+		text: 'long task',
+		targets: [
+			{ label: 'A', provider: 'p', model: 'a' },
+			{ label: 'B', provider: 'p', model: 'b' },
+		],
+		collect: 'all',
+	});
+	await h.command({ op: 'run.start' });
+	await waitFor(() => h.world.calls.startActivation.length === 2, 'both children started');
+	await h.command({ op: 'run.stop' });
+	const snapshot = await h.state();
+	assert.equal(snapshot.run.state, 'idle');
+	const node = snapshot.nodes.find((candidate) => candidate.id === fan.node.id);
+	assert.equal(node.status, 'failed');
+	assert.equal(node.error.code, 'dispatch-stopped');
+	assert.equal(node.children.every((child) => child.status === 'cancelled'), true);
+
+	await cleanup(h);
+}
+
+//#endregion
+
+//#region scenario 15: every loop iteration fans out again
+
+{
+	const h = await makeHarness();
+	const loop = await h.command({ op: 'node.add', kind: 'loop', maxIterations: 2, condition: { type: 'marker', value: '[[FLOW:DONE]]' } });
+	const fan = await h.command({
+		op: 'node.add',
+		kind: 'dispatch',
+		text: 'refine once',
+		targets: [{ label: 'A', provider: 'p', model: 'a' }],
+		collect: 'all',
+	});
+	const exit = await h.command({ op: 'node.add', kind: 'model', provider: 'exit', model: 'm' });
+	await h.command({ op: 'edge.add', from: loop.node.id, port: 'again', to: fan.node.id });
+	await h.command({ op: 'edge.add', from: fan.node.id, port: 'next', to: loop.node.id });
+	await h.command({ op: 'edge.add', from: loop.node.id, port: 'exit', to: exit.node.id });
+
+	await h.command({ op: 'run.start' });
+	const snapshot = await waitForState(h, (value) => value.run.state === 'done', 'the fan-out loop to settle');
+	assert.equal(h.world.calls.startActivation.length, 2, 'each iteration started a fresh child');
+	assert.equal(snapshot.counters[loop.node.id], 2);
+	assert.equal(h.world.calls.selectModel[0].provider, 'exit');
 
 	await cleanup(h);
 }

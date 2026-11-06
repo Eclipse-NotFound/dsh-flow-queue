@@ -1,6 +1,6 @@
 # dsh-flow-queue
 
-A visual flow editor for DeepSeek Harness, in the right sidebar. Draw **prompts, model switches, commands, condition branches, loops and checkpoints** as one directed graph; the Harness executes it in connection order — and **only at turn boundaries**.
+A visual flow editor for DeepSeek Harness, in the right sidebar. Draw **prompts, model switches, commands, condition branches, loops, checkpoints and subagent fan-outs** as one directed graph; the Harness executes it in connection order — and **only at turn boundaries**.
 
 ## Why it exists
 
@@ -34,6 +34,7 @@ Two entry points open it: the icon beside Settings at the sidebar foot, and the 
 | Branch | Evaluates a condition and picks a path | yes / no |
 | Loop | Follows "again" until the exit condition holds or the iteration cap is reached | again / exit |
 | Checkpoint | Stops and waits for a human to press continue | next |
+| Fan-out | Sends one shared prompt to up to 8 throwaway subagents (`spawn` backend) — each lane may force its own provider/model/effort or inherit the session route — then aggregates every lane's output into the flow outcome. Collection is `all`, `k-of-n` (cancel the stragglers once k finish) or `first`. The parent turn is untouched, so the fan-out waits *beside* the boundary, never across it | next |
 
 ### Conditions
 
@@ -96,7 +97,7 @@ node test/offline-check.mjs      # Host module against a mock Cordis context
 node test/client-apply-check.mjs # client activation against a mock loader/context
 ```
 
-The Host check runs eight scenarios: boundary guard, branching, loops (including the iteration cap), checkpoint, command step, attachments, package round-trip, and the validation guards. The client check emulates the browser module loader and confirms `apply` registers the tab type, the tab body and the sidebar entry.
+The Host check runs fifteen scenarios: boundary guard, branching, loops (including the iteration cap), checkpoint, command step, attachments, package round-trip, validation guards, mention catalogs and inline command lines, the natural-language judge, fan-out aggregation with a failing lane, early k-of-n collection, fan-out timeout, stop-cancels-fan-out, and loop re-fan-out. The client check emulates the browser module loader and confirms `apply` registers the tab type, the tab body and the sidebar entry.
 
 ### Updating a running install
 
@@ -106,7 +107,7 @@ The Host half is loaded once per process, so a Host change needs a bundle toggle
 
 - package variables (`{{var}}` placeholders filled at load time);
 - attachment thumbnails, drag reordering, marquee selection, undo/redo;
-- an LLM-judged branch (the completion-marker convention stands in for it, to avoid an extra model call per turn);
+- fan-out lanes beyond 8 per step, and cross-step sharing of one fan-out's results;
 - canvas and inspector side by side (in a narrow column they take turns; ← returns to the canvas).
 
 ## License
