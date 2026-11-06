@@ -46,7 +46,7 @@ async function makeHarness(options = {}) {
 	const routes = new Map();
 	const listeners = new Map();
 	const calls = { selectModel: [], prompt: [], command: [], startActivation: [] };
-	const world = { agentStatus: 'idle', agentLive: true, routes, listeners, calls, stateDir, children: {} };
+	const world = { agentStatus: 'idle', agentLive: true, routes, listeners, calls, stateDir, children: {}, promptFailFor: null };
 
 	const ctx = {
 		effect(run) {
@@ -163,6 +163,7 @@ async function makeHarness(options = {}) {
 			},
 			async prompt(request) {
 				calls.prompt.push(request);
+				if (world.promptFailFor !== null && world.promptFailFor.has(request.sessionId)) throw new Error('delivery refused');
 				return { accepted: true };
 			},
 			async resolveAgent(id) {
@@ -248,6 +249,24 @@ async function makeHarness(options = {}) {
 	}
 
 	return { world, call, command, state, turnStart, assistant, turnEnd, toolError, emit, session };
+}
+
+const FLEET_ROUTE = '/flow-queue/api/fleet';
+
+async function fleetOp(h, body) {
+	const response = await h.call(FLEET_ROUTE, { method: 'POST', body: { sessionId: SESSION, ...body } });
+	assert.equal(response.status, 200, `fleet op ${body.op} failed: ${JSON.stringify(response.json && response.json.error)}`);
+	return response.json.value;
+}
+
+async function fleetState(h) {
+	const response = await h.call(FLEET_ROUTE, { search: `?sessionId=${SESSION}` });
+	assert.equal(response.status, 200);
+	return response.json.value;
+}
+
+function targetEvent(h, sessionId, event) {
+	h.emit('session/event', { id: sessionId, header: {} }, event);
 }
 
 const ROUTES = {
@@ -801,6 +820,194 @@ async function cleanup(harness) {
 	assert.equal(h.world.calls.startActivation.length, 2, 'each iteration started a fresh child');
 	assert.equal(snapshot.counters[loop.node.id], 2);
 	assert.equal(h.world.calls.selectModel[0].provider, 'exit');
+
+	await cleanup(h);
+}
+
+//#endregion
+
+//#region scenario 16: a send step delivers to another fleet session via the outbox
+
+{
+	const h = await makeHarness({ outboxPumpMs: 120 });
+	const added = await fleetOp(h, { op: 'session.add', targetSessionId: 'T1', alias: 'worker', role: 'worker' });
+	assert.ok(added.session.nodeId.startsWith('fs_'), 'fleet sessions get fs_ node ids');
+
+	const send = await h.command({ op: 'node.add', kind: 'send', text: 'go', targetRef: added.session.nodeId });
+	const after = await h.command({ op: 'node.add', kind: 'model', provider: 'next', model: 'm' });
+	await h.command({ op: 'edge.add', from: send.node.id, port: 'next', to: after.node.id });
+
+	await h.command({ op: 'run.start' });
+	const snapshot = await waitForState(h, (value) => value.run.state === 'done', 'the send flow to settle');
+	let delivered;
+	for (let attempt = 0; attempt < 100 && delivered === undefined; attempt += 1) {
+		delivered = h.world.calls.prompt.find((request) => request.sessionId === 'T1');
+		if (delivered === undefined) await sleep(40);
+	}
+	assert.ok(delivered, 'the message reached the target session');
+	assert.equal(delivered.mode, 'queue', 'cross-session delivery lands in the target queue');
+	assert.equal(delivered.content[0].text, 'go');
+	const sendView = snapshot.nodes.find((node) => node.id === send.node.id);
+	assert.equal(sendView.status, 'completed');
+	assert.equal(sendView.target, 'T1');
+	const fleet = await fleetState(h);
+	assert.equal(fleet.fleet.hops, 1, 'one send counted one hop');
+	assert.equal(fleet.sessions[0].agentStatus, 'idle');
+
+	// Fleet CRUD round-trip: update, edge add/remove, session remove.
+	await fleetOp(h, { op: 'session.update', nodeId: added.session.nodeId, alias: 'reviewer', role: 'reviewer' });
+	const edge = await fleetOp(h, { op: 'edge.add', from: added.session.nodeId, to: added.session.nodeId });
+	// Self edges are allowed at storage level? normalizeFleetEdge only checks ends exist; the engine does not use fleet edges. Keep as stored.
+	await fleetOp(h, { op: 'edge.remove', id: edge.edge.id });
+	await fleetOp(h, { op: 'session.remove', nodeId: added.session.nodeId });
+	assert.equal((await fleetState(h)).sessions.length, 0);
+	void edge;
+
+	await cleanup(h);
+}
+
+//#endregion
+
+//#region scenario 17: outbox backoff, dead letter blocks order, retry revives
+
+{
+	const h = await makeHarness({ outboxBackoffMs: [40, 40, 40, 40, 40], outboxPumpMs: 50 });
+	h.world.promptFailFor = new Set(['T2']);
+	const added = await fleetOp(h, { op: 'session.add', targetSessionId: 'T2', alias: 'flaky' });
+
+	const first = await h.command({ op: 'node.add', kind: 'send', text: 'A', targetRef: added.session.nodeId });
+	const second = await h.command({ op: 'node.add', kind: 'send', text: 'B', targetRef: added.session.nodeId });
+	await h.command({ op: 'edge.add', from: first.node.id, port: 'next', to: second.node.id });
+	await h.command({ op: 'run.start' });
+	await waitForState(h, (value) => value.run.state === 'done', 'both sends to enqueue');
+
+	// The head letter exhausts its attempts and dies; the second stays parked.
+	let dead = 0;
+	for (let attempt = 0; attempt < 160 && dead !== 1; attempt += 1) {
+		dead = (await fleetState(h)).sessions[0].outbox.dead;
+		if (dead !== 1) await sleep(50);
+	}
+	assert.equal(dead, 1, 'the head letter died after its attempts');
+
+	// Revive: the pump delivers A then B, in order.
+	h.world.promptFailFor = null;
+	await fleetOp(h, { op: 'outbox.retry', targetSessionId: 'T2' });
+	let sawB = false;
+	for (let attempt = 0; attempt < 160 && !sawB; attempt += 1) {
+		sawB = h.world.calls.prompt.some((request) => request.sessionId === 'T2' && request.content[0].text === 'B');
+		if (!sawB) await sleep(50);
+	}
+	assert.equal(sawB, true, 'the revived queue drained through B');
+	const texts = h.world.calls.prompt.filter((request) => request.sessionId === 'T2').map((request) => request.content[0].text);
+	const delivered = texts.filter((text) => text === 'A' || text === 'B');
+	assert.equal(delivered[delivered.length - 2], 'A', 'A delivered before B');
+	assert.equal(delivered[delivered.length - 1], 'B');
+
+	await cleanup(h);
+}
+
+//#endregion
+
+//#region scenario 18: wait-idle releases when the target finishes a turn
+
+{
+	const h = await makeHarness();
+	const added = await fleetOp(h, { op: 'session.add', targetSessionId: 'T3', alias: 'planner' });
+	const wait = await h.command({ op: 'node.add', kind: 'wait', targetRef: added.session.nodeId, until: 'idle' });
+	const after = await h.command({ op: 'node.add', kind: 'model', provider: 'relased', model: 'm' });
+	await h.command({ op: 'edge.add', from: wait.node.id, port: 'next', to: after.node.id });
+
+	await h.command({ op: 'run.start' });
+	let waitRunning = false;
+	for (let attempt = 0; attempt < 100 && !waitRunning; attempt += 1) {
+		const current = await h.state();
+		waitRunning = current.nodes.find((node) => node.id === wait.node.id).status === 'running';
+		if (!waitRunning) await sleep(30);
+	}
+	assert.equal(waitRunning, true, 'the wait is pending');
+
+	targetEvent(h, 'T3', { type: 'assistant/message', seq: 2, time: Date.now(), data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'plan ready' }], source: { kind: 'model', provider: 'p', model: 'm' } }, stream: [] } });
+	targetEvent(h, 'T3', { type: 'turn/end', seq: 3, time: Date.now(), data: { turn: 1, reason: { kind: 'completed' } } });
+
+	await waitFor(() => h.world.calls.selectModel.length === 1, 'the step after the wait');
+	const snapshot = await h.state();
+	assert.equal(snapshot.nodes.find((node) => node.id === wait.node.id).status, 'completed');
+	assert.equal(snapshot.run.state, 'done');
+
+	await cleanup(h);
+}
+
+//#endregion
+
+//#region scenario 19: wait-marker releases on the target's report line
+
+{
+	const h = await makeHarness();
+	const added = await fleetOp(h, { op: 'session.add', targetSessionId: 'T3b', alias: 'worker' });
+	const wait = await h.command({ op: 'node.add', kind: 'wait', targetRef: added.session.nodeId, until: 'marker', marker: '[[FLOW:REPORT' });
+	const after = await h.command({ op: 'node.add', kind: 'command', command: '/compact' });
+	await h.command({ op: 'edge.add', from: wait.node.id, port: 'next', to: after.node.id });
+
+	await h.command({ op: 'run.start' });
+	// A turn WITHOUT the marker must not release the wait.
+	targetEvent(h, 'T3b', { type: 'assistant/message', seq: 2, time: Date.now(), data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'still working' }], source: { kind: 'model', provider: 'p', model: 'm' } }, stream: [] } });
+	targetEvent(h, 'T3b', { type: 'turn/end', seq: 3, time: Date.now(), data: { turn: 1, reason: { kind: 'completed' } } });
+	await sleep(200);
+	assert.equal(h.world.calls.command.length, 0, 'a markerless turn does not release the wait');
+
+	targetEvent(h, 'T3b', { type: 'assistant/message', seq: 4, time: Date.now(), data: { turn: 2, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: 'done\n[[FLOW:REPORT ready]]' }], source: { kind: 'model', provider: 'p', model: 'm' } }, stream: [] } });
+	targetEvent(h, 'T3b', { type: 'turn/end', seq: 5, time: Date.now(), data: { turn: 2, reason: { kind: 'completed' } } });
+
+	await waitFor(() => h.world.calls.command.length === 1, 'the marker to release the wait');
+	const snapshot = await h.state();
+	assert.equal(snapshot.nodes.find((node) => node.id === wait.node.id).status, 'completed');
+
+	await cleanup(h);
+}
+
+//#endregion
+
+//#region scenario 20: hop cap and the honest change-attachment block
+
+{
+	const h = await makeHarness({ maxCommHops: 1, outboxPumpMs: 120 });
+	const added = await fleetOp(h, { op: 'session.add', targetSessionId: 'T4', alias: 'reviewer' });
+
+	// One work turn happens inside the run; the file edit lands mid-run so the
+	// send's change block can attribute it (changes before the run are not
+	// this task's).
+	const work = await h.command({ op: 'node.add', kind: 'prompt', text: 'do the work' });
+	const send = await h.command({ op: 'node.add', kind: 'send', text: 'review please', targetRef: added.session.nodeId, attachChanges: true });
+	const capped = await h.command({ op: 'node.add', kind: 'send', text: 'one more', targetRef: added.session.nodeId });
+	await h.command({ op: 'edge.add', from: work.node.id, port: 'next', to: send.node.id });
+	await h.command({ op: 'edge.add', from: send.node.id, port: 'next', to: capped.node.id });
+
+	await h.command({ op: 'run.start' });
+	await waitFor(() => h.world.calls.prompt.some((request) => request.sessionId === SESSION), 'the work turn to start');
+	const exec = { agent: { session: { id: SESSION, header: {} } } };
+	await h.emit('tools/pre-execute', exec, async () => ({}));
+	await h.emit('fs/write-intent', 'D:\\work\\demo\\a.txt', exec, async () => ({ ok: true }));
+	h.turnStart(1);
+	h.assistant(1, 'work done');
+	h.turnEnd(1);
+
+	const snapshot = await waitForState(h, (value) => value.run.state === 'done', 'the capped flow to settle');
+	let delivered;
+	for (let attempt = 0; attempt < 100 && delivered === undefined; attempt += 1) {
+		delivered = h.world.calls.prompt.find((request) => request.sessionId === 'T4');
+		if (delivered === undefined) await sleep(40);
+	}
+	assert.ok(delivered, 'the attached message was delivered');
+	assert.ok(delivered.content[0].text.includes('<flow-changes method="intent-only"'), 'the change block is labelled with its method');
+	assert.ok(delivered.content[0].text.toLowerCase().includes('a.txt'), 'the touched path is listed');
+	const cappedView = snapshot.nodes.find((node) => node.id === capped.node.id);
+	assert.equal(cappedView.status, 'failed');
+	assert.equal(cappedView.error.code, 'hop-limit');
+	assert.equal((await fleetState(h)).fleet.hops, 1);
+
+	// Resetting hops unblocks further sends.
+	await fleetOp(h, { op: 'reset-hops' });
+	assert.equal((await fleetState(h)).fleet.hops, 0);
 
 	await cleanup(h);
 }

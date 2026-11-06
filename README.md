@@ -1,6 +1,6 @@
 # dsh-flow-queue
 
-A visual flow editor for DeepSeek Harness, in the right sidebar. Draw **prompts, model switches, commands, condition branches, loops, checkpoints and subagent fan-outs** as one directed graph; the Harness executes it in connection order — and **only at turn boundaries**.
+A visual flow editor for DeepSeek Harness, in the right sidebar. Draw **prompts, model switches, commands, condition branches, loops, checkpoints, subagent fan-outs and cross-session sends/waits** as one directed graph; the Harness executes it in connection order — and **only at turn boundaries**. A **Fleet** view layers the workspace's collaborating sessions above the flows.
 
 ## Why it exists
 
@@ -35,6 +35,8 @@ Two entry points open it: the icon beside Settings at the sidebar foot, and the 
 | Loop | Follows "again" until the exit condition holds or the iteration cap is reached | again / exit |
 | Checkpoint | Stops and waits for a human to press continue | next |
 | Fan-out | Sends one shared prompt to up to 8 throwaway subagents (`spawn` backend) — each lane may force its own provider/model/effort or inherit the session route — then aggregates every lane's output into the flow outcome. Collection is `all`, `k-of-n` (cancel the stragglers once k finish) or `first`. The parent turn is untouched, so the fan-out waits *beside* the boundary, never across it | next |
+| Send message | Delivers one message to another fleet session (persisted first, backoff retries, strictly ordered per target; a dead letter blocks its queue until revived). May attach this session's touched-file list (file-tool intents only, blind spots labelled) | next |
+| Wait session | Waits until the target finished a turn after the wait started and is idle, or until its latest turn text contains a marker (`[[FLOW:REPORT` by default) | next |
 
 ### Conditions
 
@@ -97,7 +99,7 @@ node test/offline-check.mjs      # Host module against a mock Cordis context
 node test/client-apply-check.mjs # client activation against a mock loader/context
 ```
 
-The Host check runs fifteen scenarios: boundary guard, branching, loops (including the iteration cap), checkpoint, command step, attachments, package round-trip, validation guards, mention catalogs and inline command lines, the natural-language judge, fan-out aggregation with a failing lane, early k-of-n collection, fan-out timeout, stop-cancels-fan-out, and loop re-fan-out. The client check emulates the browser module loader and confirms `apply` registers the tab type, the tab body and the sidebar entry.
+The Host check runs twenty scenarios: boundary guard, branching, loops (including the iteration cap), checkpoint, command step, attachments, package round-trip, validation guards, mention catalogs and inline command lines, the natural-language judge, fan-out aggregation with a failing lane, early k-of-n collection, fan-out timeout, stop-cancels-fan-out, loop re-fan-out, outbox delivery with fleet CRUD, backoff/dead-letter/revive ordering, wait-idle, wait-marker, and the hop cap with the change-attribution block. The client check emulates the browser module loader and confirms `apply` registers the tab type, the tab body and the sidebar entry.
 
 ### Updating a running install
 

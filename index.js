@@ -42,8 +42,28 @@ let dispatchMinTimeoutMs = DISPATCH_MIN_TIMEOUT_MS;
 const DISPATCH_CHILD_STATUSES = new Set(['pending', 'running', 'done', 'failed', 'timeout', 'cancelled', 'interrupted']);
 const DISPATCH_COLLECT_MODES = new Set(['all', 'k-of-n', 'first']);
 
+const FLEET_VERSION = 1;
+const MAX_FLEET_SESSIONS = 16;
+const MAX_FLEET_EDGES = 48;
+const MAX_COMM_HOPS = 50;
+// Fleet-tunable at apply time (tests cap it at 1; the M4 pilot may tighten it).
+let maxCommHops = MAX_COMM_HOPS;
+const OUTBOX_MAX_ATTEMPTS = 5;
+const OUTBOX_BACKOFF_MS = [2000, 4000, 8000, 16000, 32000, 60000];
+const OUTBOX_PUMP_MS = 2000;
+// Tests shrink both, exactly like the dispatch timeout floor.
+let outboxBackoffMs = OUTBOX_BACKOFF_MS;
+let outboxPumpMs = OUTBOX_PUMP_MS;
+const WAIT_MIN_TIMEOUT_MS = 5000;
+const WAIT_MAX_TIMEOUT_MS = 3600000;
+const WAIT_DEFAULT_TIMEOUT_MS = 900000;
+let waitMinTimeoutMs = WAIT_MIN_TIMEOUT_MS;
+const WAIT_MODES = new Set(['idle', 'marker']);
+const DEFAULT_REPORT_MARKER = '[[FLOW:REPORT';
+const MAX_FLEET_IDENT = 120;
+
 const NODE_STATUSES = new Set(['idle', 'running', 'completed', 'failed', 'skipped', 'waiting']);
-const NODE_KINDS = new Set(['prompt', 'model', 'command', 'checkpoint', 'branch', 'loop', 'dispatch']);
+const NODE_KINDS = new Set(['prompt', 'model', 'command', 'checkpoint', 'branch', 'loop', 'dispatch', 'send', 'wait']);
 const PORTS = {
 	prompt: ['next'],
 	model: ['next'],
@@ -52,6 +72,8 @@ const PORTS = {
 	branch: ['yes', 'no'],
 	loop: ['again', 'exit'],
 	dispatch: ['next'],
+	send: ['next'],
+	wait: ['next'],
 };
 const CONDITION_TYPES = new Set(['always', 'regex', 'contains', 'marker', 'tool-failed', 'last-failed', 'judge']);
 
@@ -278,6 +300,20 @@ function normalizeNode(input) {
 			}
 			break;
 		}
+		case 'send': {
+			node.text = typeof input.text === 'string' ? input.text.slice(0, MAX_PROMPT_CHARS) : '';
+			node.targetRef = typeof input.targetRef === 'string' ? input.targetRef.slice(0, MAX_IDENT_CHARS) : '';
+			node.attachChanges = input.attachChanges === true;
+			break;
+		}
+		case 'wait': {
+			node.targetRef = typeof input.targetRef === 'string' ? input.targetRef.slice(0, MAX_IDENT_CHARS) : '';
+			node.until = WAIT_MODES.has(input.until) ? input.until : 'idle';
+			node.marker = typeof input.marker === 'string' && input.marker.trim() !== '' ? input.marker.trim().slice(0, 200) : DEFAULT_REPORT_MARKER;
+			const timeout = Number.isFinite(input.timeoutMs) ? Math.round(input.timeoutMs) : WAIT_DEFAULT_TIMEOUT_MS;
+			node.timeoutMs = Math.min(Math.max(timeout, waitMinTimeoutMs), WAIT_MAX_TIMEOUT_MS);
+			break;
+		}
 		default:
 			break;
 	}
@@ -315,14 +351,45 @@ export function apply(ctx, config = {}) {
 	if (Number.isFinite(config.dispatchMinTimeoutMs)) {
 		dispatchMinTimeoutMs = Math.max(50, Math.round(config.dispatchMinTimeoutMs));
 	}
+	if (Number.isFinite(config.waitMinTimeoutMs)) {
+		waitMinTimeoutMs = Math.max(50, Math.round(config.waitMinTimeoutMs));
+	}
+	if (Array.isArray(config.outboxBackoffMs) && config.outboxBackoffMs.length > 0) {
+		outboxBackoffMs = config.outboxBackoffMs.filter((value) => Number.isFinite(value) && value >= 10).map((value) => Math.round(value));
+		if (outboxBackoffMs.length === 0) outboxBackoffMs = OUTBOX_BACKOFF_MS;
+	}
+	if (Number.isFinite(config.outboxPumpMs)) {
+		outboxPumpMs = Math.max(50, Math.round(config.outboxPumpMs));
+	}
+	if (Number.isFinite(config.maxCommHops)) {
+		maxCommHops = Math.max(1, Math.round(config.maxCommHops));
+	}
 	const graphDir = path.join(baseDir, 'sessions');
 	const packageDir = path.join(baseDir, 'packages');
+	const fleetDir = path.join(baseDir, 'fleet');
+	const outboxDir = path.join(baseDir, 'outbox');
 
 	const graphs = new Map();
 	const watchdogs = new Map();
 	const dispatchRuns = new Map();
 	const timers = new Set();
 	const writeChains = new Map();
+	const fleets = new Map();
+	const fleetChains = new Map();
+	const waitRegistry = new Map(); // wait node id -> { sessionId, graph, targetSessionId, since, mode, marker }
+	// Per-session activity for every session this process sees (not just flow
+	// sessions): the L0 fleet view and wait steps observe other sessions.
+	const activity = new Map(); // sessionId -> { lastTurnEndAt, lastText }
+	// Change attribution (report 2026-11-06, L1 bookkeeping): which paths a
+	// session's file tools touched, mirroring the recorder's own events so a
+	// send step can attach an honest "files this task touched" block.
+	const attribution = {
+		execSession: new WeakMap(), // tool exec -> root sessionId
+		latestTurn: new Map(), // sessionId -> turn
+		cwds: new Map(), // sessionId -> cwd
+		parents: new Map(), // subagent sessionId -> parent sessionId
+		touched: new Map(), // sessionId -> Map(path -> lastAt)
+	};
 
 	function track(handle) {
 		timers.add(handle);
@@ -498,6 +565,342 @@ export function apply(ctx, config = {}) {
 			.catch(() => {});
 		writeChains.set(sessionId, next);
 		return next;
+	}
+
+	//#endregion
+
+	//#region fleet & outbox
+
+	function emptyFleet(key) {
+		return { version: FLEET_VERSION, key, sessions: [], edges: [], hops: 0, createdAt: Date.now() };
+	}
+
+	function fleetFile(key) {
+		const safe = String(key).replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 128);
+		return path.join(fleetDir, `${safe}.json`);
+	}
+
+	function normalizeFleetSession(input) {
+		if (input === null || typeof input !== 'object') return undefined;
+		const sessionId = typeof input.sessionId === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(input.sessionId) ? input.sessionId : undefined;
+		if (sessionId === undefined) return undefined;
+		return {
+			nodeId: typeof input.nodeId === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(input.nodeId) ? input.nodeId : newId('fs'),
+			sessionId,
+			alias: typeof input.alias === 'string' ? input.alias.slice(0, 60) : '',
+			role: typeof input.role === 'string' ? input.role.slice(0, 40) : '',
+			note: typeof input.note === 'string' ? input.note.slice(0, 300) : '',
+		};
+	}
+
+	function normalizeFleetEdge(input, sessions) {
+		if (input === null || typeof input !== 'object') return undefined;
+		const kinds = new Set(['send', 'wait', 'note']);
+		const kind = kinds.has(input.kind) ? input.kind : 'send';
+		if (typeof input.from !== 'string' || typeof input.to !== 'string') return undefined;
+		const ids = new Set(sessions.map((session) => session.nodeId));
+		if (!ids.has(input.from) || !ids.has(input.to)) return undefined;
+		return { id: newId('fe'), from: input.from, to: input.to, kind };
+	}
+
+	async function ensureFleet(key) {
+		const existing = fleets.get(key);
+		if (existing !== undefined) return existing;
+		let fleet = emptyFleet(key);
+		try {
+			const parsed = JSON.parse(await readFile(fleetFile(key), 'utf8'));
+			if (parsed !== null && typeof parsed === 'object' && Array.isArray(parsed.sessions)) {
+				const sessions = parsed.sessions.map(normalizeFleetSession).filter((session) => session !== undefined).slice(0, MAX_FLEET_SESSIONS);
+				const edges = Array.isArray(parsed.edges)
+					? parsed.edges.map((edge) => normalizeFleetEdge(edge, sessions)).filter((edge) => edge !== undefined).slice(0, MAX_FLEET_EDGES)
+					: [];
+				// Keep node ids stable across restarts.
+				const seen = new Set();
+				for (const session of sessions) {
+					if (seen.has(session.nodeId)) session.nodeId = newId('fs');
+					seen.add(session.nodeId);
+				}
+				fleet = {
+					version: FLEET_VERSION,
+					key,
+					sessions,
+					edges,
+					hops: Number.isFinite(parsed.hops) ? Math.max(0, Math.round(parsed.hops)) : 0,
+					createdAt: Number.isFinite(parsed.createdAt) ? parsed.createdAt : Date.now(),
+				};
+			}
+		} catch {
+			/* no stored fleet yet: start clean */
+		}
+		fleets.set(key, fleet);
+		return fleet;
+	}
+
+	function persistFleet(fleet) {
+		const file = fleetFile(fleet.key);
+		const payload = JSON.stringify({ ...fleet, updatedAt: Date.now() });
+		const previous = fleetChains.get(fleet.key) ?? Promise.resolve();
+		const next = previous
+			.then(async () => {
+				await mkdir(fleetDir, { recursive: true });
+				const temporary = `${file}.tmp`;
+				await writeFile(temporary, payload, 'utf8');
+				await rename(temporary, file);
+			})
+			.catch(() => {});
+		fleetChains.set(fleet.key, next);
+		return next;
+	}
+
+	/** The fleet a session belongs to is keyed by its workspace directory. */
+	async function fleetKeyOf(sessionId) {
+		try {
+			const resolved = await ctx.sessionController.resolveAgent(sessionId);
+			const agent = resolved === undefined ? undefined : resolved.agent;
+			const session = agent === undefined ? undefined : agent.session;
+			let cwd;
+			if (session !== undefined) {
+				cwd = typeof session.header?.cwd === 'string' && session.header.cwd !== '' ? session.header.cwd : undefined;
+				if (cwd === undefined) {
+					const workingDirectory = ctx.get('workingDirectory');
+					if (workingDirectory !== undefined) cwd = workingDirectory.get(session);
+				}
+			}
+			if (cwd === undefined || cwd === '') return 'default';
+			return cwd.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 120);
+		} catch {
+			return 'default';
+		}
+	}
+
+	/** Resolve a send/wait target reference: a fleet node id, or a raw session id. */
+	async function resolveTargetRef(sessionId, ref) {
+		if (ref === '') return undefined;
+		const fleet = await ensureFleet(await fleetKeyOf(sessionId));
+		const entry = fleet.sessions.find((session) => session.nodeId === ref || session.sessionId === ref);
+		if (entry !== undefined) return { sessionId: entry.sessionId, alias: entry.alias, fleet };
+		if (/^[A-Za-z0-9_-]{1,128}$/.test(ref)) return { sessionId: ref, alias: '', fleet };
+		return undefined;
+	}
+
+	function outboxFile(sessionId) {
+		const safe = String(sessionId).replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 128);
+		return path.join(outboxDir, `${safe}.jsonl`);
+	}
+
+	async function readOutbox(targetSessionId) {
+		try {
+			const raw = await readFile(outboxFile(targetSessionId), 'utf8');
+			const entries = [];
+			for (const line of raw.split('\n')) {
+				const trimmed = line.trim();
+				if (trimmed === '') continue;
+				try {
+					const parsed = JSON.parse(trimmed);
+					if (parsed !== null && typeof parsed === 'object') entries.push(parsed);
+				} catch {
+					/* skip a corrupt line */
+				}
+			}
+			return entries;
+		} catch {
+			return [];
+		}
+	}
+
+	async function writeOutbox(targetSessionId, entries) {
+		await mkdir(outboxDir, { recursive: true });
+		if (entries.length === 0) {
+			await rm(outboxFile(targetSessionId), { force: true });
+			return;
+		}
+		await writeFile(outboxFile(targetSessionId), entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n', 'utf8');
+	}
+
+	/**
+	 * Deliver one message to another session. Persisted before delivery,
+	 * retried with backoff, strictly ordered per target: the head entry of a
+	 * target's outbox is the only one in flight (the superagent delivery
+	 * discipline, kept for cross-session sends).
+	 */
+	async function enqueueSend(fromSessionId, targetSessionId, text) {
+		const entries = await readOutbox(targetSessionId);
+		entries.push({
+			id: `ob_${randomUUID().replace(/-/g, '').slice(0, 16)}`,
+			from: fromSessionId,
+			to: targetSessionId,
+			text: text.slice(0, MAX_PROMPT_CHARS),
+			attempts: 0,
+			nextAt: Date.now(),
+			status: 'pending',
+			createdAt: Date.now(),
+		});
+		await writeOutbox(targetSessionId, entries);
+		scheduleOutboxPump();
+	}
+
+	const outboxPumping = new Set();
+	let outboxTimer = undefined;
+
+	async function pumpTarget(targetSessionId) {
+		if (outboxPumping.has(targetSessionId)) return;
+		outboxPumping.add(targetSessionId);
+		try {
+			const entries = await readOutbox(targetSessionId);
+			// Ordering per target: a dead letter blocks everything behind it
+			// until a person revives it (the superagent delivery discipline).
+			const head = entries.find((entry) => entry.status === 'pending' || entry.status === 'dead');
+			if (head === undefined) return;
+			if (head.status === 'dead') return;
+			if (Number.isFinite(head.nextAt) && head.nextAt > Date.now()) return;
+			try {
+				await ctx.sessionController.prompt(
+					{
+						requestId: `flow-queue-send-${head.id}`,
+						sessionId: targetSessionId,
+						mode: 'queue',
+						content: [{ type: 'text', text: head.text }],
+						clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+					},
+					new AbortController().signal,
+				);
+				head.status = 'delivered';
+				head.deliveredAt = Date.now();
+				await writeOutbox(targetSessionId, entries.filter((entry) => entry.status !== 'delivered'));
+			} catch (error) {
+				head.attempts = (head.attempts ?? 0) + 1;
+				const backoff = outboxBackoffMs[Math.min(head.attempts, outboxBackoffMs.length) - 1] ?? 60000;
+				if (head.attempts >= OUTBOX_MAX_ATTEMPTS) {
+					head.status = 'dead';
+					head.error = error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200);
+				} else {
+					head.nextAt = Date.now() + backoff;
+				}
+				await writeOutbox(targetSessionId, entries);
+			}
+		} finally {
+			outboxPumping.delete(targetSessionId);
+		}
+	}
+
+	function scheduleOutboxPump() {
+		if (outboxTimer !== undefined) return;
+		outboxTimer = track(setTimeout(() => {
+			outboxTimer = undefined;
+			void pumpOutbox();
+		}, Math.min(250, outboxPumpMs)));
+	}
+
+	async function pumpOutbox() {
+		let entries = [];
+		try {
+			entries = await readdir(outboxDir);
+		} catch {
+			return;
+		}
+		const targets = entries.filter((name) => name.endsWith('.jsonl')).map((name) => name.slice(0, -'.jsonl'.length));
+		await Promise.all(targets.map((target) => pumpTarget(target).catch(() => {})));
+		// Keep pumping while any outbox still has pending work.
+		let pending = false;
+		for (const target of targets) {
+			const list = await readOutbox(target);
+			if (list.some((entry) => entry.status === 'pending')) {
+				pending = true;
+				break;
+			}
+		}
+		if (pending) scheduleOutboxPump();
+	}
+
+	//#endregion
+
+	//#region change attribution
+
+	/** Root session of a lineage: a subagent's file edits count for its parent. */
+	function rootSessionOf(sessionId) {
+		let current = sessionId;
+		const visited = new Set();
+		for (let depth = 0; depth < 8; depth += 1) {
+			const parent = attribution.parents.get(current);
+			if (parent === undefined || visited.has(parent)) return current;
+			visited.add(parent);
+			current = parent;
+		}
+		return current;
+	}
+
+	function canonicalPath(target, cwd) {
+		let absolute = target;
+		const fsService = ctx.get('fs');
+		if (fsService !== undefined && typeof fsService.processPath === 'function') {
+			try {
+				absolute = fsService.processPath(target);
+			} catch {
+				/* fall back to plain resolution */
+			}
+		}
+		if (typeof absolute !== 'string') absolute = String(target);
+		if (!path.isAbsolute(absolute)) absolute = path.resolve(cwd ?? process.cwd(), absolute);
+		absolute = path.normalize(absolute);
+		return process.platform === 'win32' ? absolute.toLowerCase() : absolute;
+	}
+
+	// The attribution bookkeeping mirrors the recorder's own events (proven by
+	// dsh-usage-replay's sessionScopedEdits): map each tool execution to its
+	// root session, then record fs write/edit intents under that session.
+	ctx.on('tools/pre-execute', (exec, next) => {
+		try {
+			const session = exec === undefined ? undefined : exec.agent?.session;
+			if (session !== undefined) attribution.execSession.set(exec, rootSessionOf(session.id));
+		} catch {
+			/* attribution must never break a tool call */
+		}
+		return next();
+	});
+	const intentListener = async (target, actor, next) => {
+		const intent = await next();
+		try {
+			const sessionId = actor === undefined || actor === null ? undefined : attribution.execSession.get(actor);
+			if (sessionId === undefined) return intent;
+			const absolute = canonicalPath(target, attribution.cwds.get(sessionId));
+			let touched = attribution.touched.get(sessionId);
+			if (touched === undefined) {
+				touched = new Map();
+				attribution.touched.set(sessionId, touched);
+			}
+			touched.set(absolute, Date.now());
+		} catch {
+			/* attribution must never break the write */
+		}
+		return intent;
+	};
+	ctx.on('fs/write-intent', intentListener);
+	ctx.on('fs/edit-intent', intentListener);
+
+	/**
+	 * Honest v1 change block for a send step: only paths this session's file
+	 * tools touched since the run started, method-labelled, with the blind
+	 * spots named. No window diff join here — that needs live
+	 * workspaceChanges and is deliberately deferred; the method field says
+	 * exactly what this block is (report invariants 1 and 3).
+	 */
+	function changeBlockOf(sessionId, since) {
+		const touched = attribution.touched.get(sessionId);
+		if (touched === undefined || touched.size === 0) {
+			return { method: 'handoff-only', text: '<flow-changes method="handoff-only">未观察到本会话经文件工具的改动；shell-only 改动与并发他话改动不在统计内。</flow-changes>' };
+		}
+		const paths = [...touched.entries()]
+			.filter(([, at]) => at >= since)
+			.sort((left, right) => left[1] - right[1])
+			.map(([file]) => file)
+			.slice(0, 200);
+		if (paths.length === 0) {
+			return { method: 'handoff-only', text: '<flow-changes method="handoff-only">本次运行开始后未观察到本会话经文件工具的改动。</flow-changes>' };
+		}
+		return {
+			method: 'intent-only',
+			text: `<flow-changes method="intent-only" session="${sessionId}" count="${paths.length}">\n${paths.map((file) => `- ${file}`).join('\n')}\n说明：仅统计本会话（含其子代理）经 DSH 文件工具写入的路径；shell 命令产生的改动与并发其他会话的改动不在此列。</flow-changes>`,
+		};
 	}
 
 	//#endregion
@@ -859,6 +1262,82 @@ export function apply(ctx, config = {}) {
 
 	//#endregion
 
+	//#region cross-session waits
+
+	function clearWaitWatchdog(nodeId) {
+		clearWatchdog(nodeId);
+	}
+
+	function armWaitWatchdog(sessionId, graph, node) {
+		clearWatchdog(node.id);
+		const handle = later(async () => {
+			if (node.status !== 'running') return;
+			const entry = waitRegistry.get(node.id);
+			if (entry === undefined) return;
+			waitRegistry.delete(node.id);
+			touchNode(node, 'failed');
+			node.error = fail('wait-timeout', `the target did not satisfy "${node.until}" within the timeout`);
+			if (graph.run.waitingNode === node.id) graph.run.waitingNode = null;
+			const next = followEdge(graph, node.id, 'next');
+			if (next === undefined) finishRun(graph, 'error', 'wait-timeout');
+			else {
+				graph.run.cursor = next;
+				if (graph.run.state === 'running') later(() => advance(sessionId), SETTLE_MS);
+			}
+			await persist(sessionId, graph);
+		}, node.timeoutMs);
+		watchdogs.set(node.id, handle);
+	}
+
+	/** Try to settle every registered wait whose target just changed. */
+	function probeWaits() {
+		for (const [nodeId, entry] of [...waitRegistry.entries()]) {
+			const { graph, node, sessionId } = entry;
+			if (graph.run.waitingNode !== nodeId || node.status !== 'running') {
+				waitRegistry.delete(nodeId);
+				continue;
+			}
+			const seen = activity.get(entry.targetSessionId);
+			if (seen === undefined) continue;
+			let satisfied = false;
+			if (entry.mode === 'marker') {
+				satisfied = typeof seen.lastText === 'string' && seen.lastText.includes(entry.marker);
+			} else {
+				// idle: the target finished at least one turn after this wait
+				// started and is not mid-turn right now.
+				satisfied = Number.isFinite(seen.lastTurnEndAt) && seen.lastTurnEndAt >= entry.since && isIdle(entry.targetSessionId);
+			}
+			if (!satisfied) continue;
+			waitRegistry.delete(nodeId);
+			clearWaitWatchdog(nodeId);
+			touchNode(node, 'completed');
+			node.result = entry.mode === 'marker' ? `收到标记 ${entry.marker}` : '目标已空闲';
+			graph.run.waitingNode = null;
+			const next = followEdge(graph, node.id, 'next');
+			if (next === undefined) finishRun(graph, 'done', 'no outgoing connection');
+			else graph.run.cursor = next;
+			void persist(sessionId, graph);
+			if (graph.run.state === 'running') later(() => advance(sessionId), SETTLE_MS);
+		}
+	}
+
+	/** Cancel in-flight waits of one graph (run.stop). */
+	function cancelWaits(graph) {
+		for (const node of graph.nodes) {
+			if (node.kind !== 'wait' || node.status !== 'running') continue;
+			waitRegistry.delete(node.id);
+			clearWaitWatchdog(node.id);
+			touchNode(node, 'failed');
+			node.error = fail('wait-stopped', 'the run was stopped while waiting');
+		}
+		if (graph.run.waitingNode !== null) {
+			const waiting = graph.run.waitingNode === null ? undefined : findNode(graph, graph.run.waitingNode);
+			if (waiting !== undefined && waiting.kind === 'wait') graph.run.waitingNode = null;
+		}
+	}
+
+	//#endregion
+
 	function finishRun(graph, state, message) {
 		graph.run.state = state;
 		graph.run.message = message ?? '';
@@ -1004,6 +1483,65 @@ export function apply(ctx, config = {}) {
 				}
 				return startDispatch(sessionId, graph, node);
 			}
+			case 'send': {
+				const text = typeof node.text === 'string' ? node.text.trim() : '';
+				if (text === '') {
+					touchNode(node, 'failed');
+					node.error = fail('empty-prompt', 'this step has no message text');
+					return { port: 'next' };
+				}
+				const target = await resolveTargetRef(sessionId, node.targetRef);
+				if (target === undefined) {
+					touchNode(node, 'failed');
+					node.error = fail('no-target', 'the target session is not in the fleet and not a valid session id');
+					return { port: 'next' };
+				}
+				// Hop guard rides with the feature (discipline: guardrails
+				// never ship later than the capability they cap).
+				if (target.fleet.hops >= maxCommHops) {
+					touchNode(node, 'failed');
+					node.error = fail('hop-limit', `the fleet reached the ${maxCommHops}-send cap; reset hops in the fleet view to continue`);
+					return { port: 'next' };
+				}
+				target.fleet.hops += 1;
+				void persistFleet(target.fleet);
+				touchNode(node, 'running');
+				await persist(sessionId, graph);
+				const payload = node.attachChanges === true
+					? `${text}\n\n${changeBlockOf(sessionId, graph.run.startedAt || node.startedAt || Date.now()).text}`
+					: text;
+				node.target = target.sessionId.slice(0, MAX_IDENT_CHARS);
+				await enqueueSend(sessionId, target.sessionId, payload);
+				touchNode(node, 'completed');
+				node.result = `已入队 → ${target.alias !== '' ? target.alias : target.sessionId.slice(0, 12)}（先存后发）`;
+				return { port: 'next' };
+			}
+			case 'wait': {
+				const target = await resolveTargetRef(sessionId, node.targetRef);
+				if (target === undefined) {
+					touchNode(node, 'failed');
+					node.error = fail('no-target', 'the target session is not in the fleet and not a valid session id');
+					return { port: 'next' };
+				}
+				touchNode(node, 'running');
+				node.target = target.sessionId.slice(0, MAX_IDENT_CHARS);
+				graph.run.waitingNode = node.id;
+				await persist(sessionId, graph);
+				waitRegistry.set(node.id, {
+					sessionId,
+					graph,
+					node,
+					targetSessionId: target.sessionId,
+					since: Date.now(),
+					mode: node.until,
+					marker: node.marker,
+				});
+				armWaitWatchdog(sessionId, graph, node);
+				// Already satisfied (target idle with a fresh-enough turn, or
+				// marker in its latest text)? Settle without waiting an event.
+				later(() => probeWaits(), SETTLE_MS);
+				return { wait: true };
+			}
 			case 'prompt':
 			default: {
 				const override = modelPartsOf(node);
@@ -1126,6 +1664,29 @@ export function apply(ctx, config = {}) {
 		if (typeof sessionId !== 'string' || event === undefined || event === null) return;
 		const graph = graphs.get(sessionId);
 
+		// Attribution bookkeeping runs for every session this process sees:
+		// lineage (subagent -> parent), the session's cwd and latest turn.
+		try {
+			const header = session === undefined ? undefined : session.header;
+			if (header !== null && typeof header === 'object') {
+				if (typeof header.parentSession === 'string' && header.parentSession !== '') attribution.parents.set(sessionId, header.parentSession);
+				if (typeof header.cwd === 'string' && header.cwd !== '') attribution.cwds.set(sessionId, header.cwd);
+			}
+			if (event.type === 'turn/start' && typeof event.data?.turn === 'number') attribution.latestTurn.set(sessionId, event.data.turn);
+		} catch {
+			/* bookkeeping must never break event handling */
+		}
+
+		// Fleet-level activity for every session: the L0 view and wait steps
+		// observe sessions that have no flow graph of their own.
+		if (event.type === 'assistant/message') {
+			const data = event.data ?? {};
+			const text = textOfBlocks(data.message === undefined ? [] : data.message.content);
+			const seen = activity.get(sessionId) ?? { lastTurnEndAt: 0, lastText: '' };
+			if (text !== '') seen.lastText = text;
+			activity.set(sessionId, seen);
+		}
+
 		if (event.type === 'assistant/message') {
 			if (graph === undefined) return;
 			const data = event.data ?? {};
@@ -1180,6 +1741,12 @@ export function apply(ctx, config = {}) {
 		}
 
 		if (event.type !== 'turn/end') return;
+		{
+			const seen = activity.get(sessionId) ?? { lastTurnEndAt: 0, lastText: '' };
+			seen.lastTurnEndAt = Date.now();
+			activity.set(sessionId, seen);
+		}
+		probeWaits();
 		if (graph === undefined) return;
 		const data = event.data ?? {};
 		const node = runningPromptNode(graph);
@@ -1238,9 +1805,13 @@ export function apply(ctx, config = {}) {
 	ctx.on('agent/status', (payload) => {
 		const agent = payload === undefined ? undefined : payload.agent;
 		const status = payload === undefined ? undefined : payload.status;
-		if (agent === undefined || status !== 'idle') return;
+		if (agent === undefined || typeof agent.id !== 'string') return;
+		if (status === 'idle') {
+			// A wait target going idle may settle a registered wait.
+			probeWaits();
+		}
+		if (status !== 'idle') return;
 		const sessionId = agent.id;
-		if (typeof sessionId !== 'string') return;
 		const graph = graphs.get(sessionId);
 		if (graph === undefined || graph.run.state !== 'running') return;
 		later(() => advance(sessionId), SETTLE_MS * 2);
@@ -1385,6 +1956,16 @@ export function apply(ctx, config = {}) {
 			if (Number.isFinite(patch.k)) node.k = Math.min(Math.max(Math.round(patch.k), 1), total);
 			if (Number.isFinite(patch.timeoutMs)) node.timeoutMs = Math.min(Math.max(Math.round(patch.timeoutMs), dispatchMinTimeoutMs), DISPATCH_MAX_TIMEOUT_MS);
 		}
+		if (node.kind === 'send') {
+			if (typeof patch.targetRef === 'string') node.targetRef = patch.targetRef.slice(0, MAX_IDENT_CHARS);
+			if (patch.attachChanges !== undefined) node.attachChanges = patch.attachChanges === true;
+		}
+		if (node.kind === 'wait') {
+			if (typeof patch.targetRef === 'string') node.targetRef = patch.targetRef.slice(0, MAX_IDENT_CHARS);
+			if (WAIT_MODES.has(patch.until)) node.until = patch.until;
+			if (typeof patch.marker === 'string') node.marker = patch.marker.trim().slice(0, 200) === '' ? DEFAULT_REPORT_MARKER : patch.marker.trim().slice(0, 200);
+			if (Number.isFinite(patch.timeoutMs)) node.timeoutMs = Math.min(Math.max(Math.round(patch.timeoutMs), waitMinTimeoutMs), WAIT_MAX_TIMEOUT_MS);
+		}
 		if (patch.provider === null) delete node.provider;
 		else if (typeof patch.provider === 'string') node.provider = patch.provider.slice(0, MAX_IDENT_CHARS);
 		if (patch.model === null) delete node.model;
@@ -1456,6 +2037,10 @@ export function apply(ctx, config = {}) {
 					collect: payload.collect,
 					k: payload.k,
 					timeoutMs: payload.timeoutMs,
+					targetRef: payload.targetRef,
+					until: payload.until,
+					marker: payload.marker,
+					attachChanges: payload.attachChanges,
 				});
 				if (node === undefined) throw fail('invalid-node', 'unknown step kind');
 				graph.nodes.push(node);
@@ -1603,6 +2188,7 @@ export function apply(ctx, config = {}) {
 			}
 			case 'run.stop': {
 				cancelDispatches(graph);
+				cancelWaits(graph);
 				graph.run.state = 'idle';
 				graph.run.cursor = null;
 				graph.run.waitingNode = null;
@@ -1861,6 +2447,139 @@ export function apply(ctx, config = {}) {
 				},
 			}),
 		'dsh-flow-queue: command route',
+	);
+
+	ctx.effect(
+		() =>
+			ctx.webServer.register({
+				kind: 'exact',
+				path: `${PREFIX}/fleet`,
+				handler: async (req, res) => {
+					if (!admitted(req)) return writeJson(res, 403, { ok: false, error: fail('forbidden', 'forbidden') });
+					if (req.method === 'GET' || req.method === 'HEAD') {
+						let sessionId = '';
+						try {
+							sessionId = new URL(req.url ?? '/', 'http://dsh.internal').searchParams.get('sessionId') ?? '';
+						} catch {
+							sessionId = '';
+						}
+						if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) {
+							return writeJson(res, 400, { ok: false, error: fail('invalid-session', 'missing or invalid sessionId') });
+						}
+						try {
+							const fleet = await ensureFleet(await fleetKeyOf(sessionId));
+							const agents = ctx.get('agents');
+							const sessionViews = [];
+							for (const entry of fleet.sessions) {
+								const agent = agents === undefined ? undefined : agents.get(entry.sessionId);
+								const seen = activity.get(entry.sessionId);
+								let outbox = { pending: 0, dead: 0 };
+								try {
+									const entries = await readOutbox(entry.sessionId);
+									outbox = {
+										pending: entries.filter((item) => item.status === 'pending').length,
+										dead: entries.filter((item) => item.status === 'dead').length,
+									};
+								} catch {
+									/* keep the zero summary */
+								}
+								sessionViews.push({
+									...entry,
+									agentStatus: agent === undefined ? 'offline' : agent.status === 'running' ? 'running' : 'idle',
+									lastTurnEndAt: seen === undefined ? 0 : seen.lastTurnEndAt,
+									outbox,
+								});
+							}
+							writeJson(res, 200, { ok: true, value: { fleet, sessions: sessionViews, maxHops: maxCommHops } });
+						} catch (error) {
+							writeJson(res, 500, { ok: false, error: fail('fleet-failed', error instanceof Error ? error.message : String(error)) });
+						}
+						return;
+					}
+					if (req.method !== 'POST') return writeJson(res, 405, { ok: false, error: fail('method-error', 'method not allowed') });
+					let payload;
+					try {
+						payload = JSON.parse(await readBody(req));
+					} catch (error) {
+						return writeJson(res, 400, { ok: false, error: fail('invalid-json', error instanceof Error ? error.message : String(error)) });
+					}
+					try {
+						const sessionId = requireSessionId(payload === null || payload === undefined ? undefined : payload.sessionId);
+						const fleet = await ensureFleet(await fleetKeyOf(sessionId));
+						switch (payload.op) {
+							case 'session.add': {
+								if (fleet.sessions.length >= MAX_FLEET_SESSIONS) throw fail('fleet-full', `the fleet already has ${MAX_FLEET_SESSIONS} sessions`);
+								const session = normalizeFleetSession({ sessionId: payload.targetSessionId, alias: payload.alias, role: payload.role, note: payload.note });
+								if (session === undefined) throw fail('invalid-session', 'a valid targetSessionId is required');
+								if (fleet.sessions.some((entry) => entry.sessionId === session.sessionId)) throw fail('fleet-duplicate', 'that session is already in the fleet');
+								fleet.sessions.push(session);
+								await persistFleet(fleet);
+								return writeJson(res, 200, { ok: true, value: { session } });
+							}
+							case 'session.update': {
+								const entry = fleet.sessions.find((candidate) => candidate.nodeId === payload.nodeId);
+								if (entry === undefined) throw fail('invalid-node', 'no such fleet session');
+								if (typeof payload.alias === 'string') entry.alias = payload.alias.slice(0, 60);
+								if (typeof payload.role === 'string') entry.role = payload.role.slice(0, 40);
+								if (typeof payload.note === 'string') entry.note = payload.note.slice(0, 300);
+								await persistFleet(fleet);
+								return writeJson(res, 200, { ok: true, value: { session: entry } });
+							}
+							case 'session.remove': {
+								const nodeId = typeof payload.nodeId === 'string' ? payload.nodeId : '';
+								fleet.sessions = fleet.sessions.filter((candidate) => candidate.nodeId !== nodeId);
+								fleet.edges = fleet.edges.filter((edge) => edge.from !== nodeId && edge.to !== nodeId);
+								await persistFleet(fleet);
+								return writeJson(res, 200, { ok: true, value: { removed: nodeId } });
+							}
+							case 'edge.add': {
+								const edge = normalizeFleetEdge({ from: payload.from, to: payload.to, kind: payload.kind }, fleet.sessions);
+								if (edge === undefined) throw fail('invalid-edge', 'both ends must be fleet sessions');
+								if (fleet.edges.length >= MAX_FLEET_EDGES) throw fail('fleet-full', `the fleet already has ${MAX_FLEET_EDGES} connections`);
+								fleet.edges.push(edge);
+								await persistFleet(fleet);
+								return writeJson(res, 200, { ok: true, value: { edge } });
+							}
+							case 'edge.remove': {
+								fleet.edges = fleet.edges.filter((edge) => edge.id !== payload.id);
+								await persistFleet(fleet);
+								return writeJson(res, 200, { ok: true, value: { removed: payload.id } });
+							}
+							case 'reset-hops': {
+								fleet.hops = 0;
+								await persistFleet(fleet);
+								return writeJson(res, 200, { ok: true, value: { hops: 0 } });
+							}
+							case 'outbox.retry': {
+								const target = typeof payload.targetSessionId === 'string' ? payload.targetSessionId : '';
+								const entries = await readOutbox(target);
+								let revived = 0;
+								for (const entry of entries) {
+									if (entry.status !== 'dead') continue;
+									entry.status = 'pending';
+									entry.attempts = 0;
+									entry.nextAt = Date.now();
+									delete entry.error;
+									revived += 1;
+								}
+								if (revived > 0) {
+									await writeOutbox(target, entries);
+									scheduleOutboxPump();
+								}
+								return writeJson(res, 200, { ok: true, value: { revived } });
+							}
+							default:
+								throw fail('invalid-command', 'unknown op');
+						}
+					} catch (error) {
+						if (error !== null && typeof error === 'object' && typeof error.code === 'string') {
+							return writeJson(res, 400, { ok: false, error });
+						}
+						return writeJson(res, 500, { ok: false, error: fail('fleet-failed', error instanceof Error ? error.message : String(error)) });
+					}
+				},
+			}),
+		'dsh-flow-queue: fleet route',
 	);
 
 	//#endregion

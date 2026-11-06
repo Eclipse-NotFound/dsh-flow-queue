@@ -21,7 +21,7 @@ window.__ModuleLoader__.load({
 		const PORT_GAP = 22;
 		// Keep in sync with package.json. Shown in the panel footer so the page's
 		// running build is identifiable at a glance during remote diagnosis.
-		const CLIENT_VERSION = '0.5.0';
+		const CLIENT_VERSION = '0.6.0';
 
 		let localeSvc = null;
 		let pluginCtx = null;
@@ -80,6 +80,44 @@ window.__ModuleLoader__.load({
 				'child.timeout': '超时',
 				'child.cancelled': '已取消',
 				'child.interrupted': '已中断',
+				'kind.send': '发送消息',
+				'kind.wait': '等待会话',
+				'until.idle': '等目标空闲',
+				'until.marker': '等产出标记',
+				'inspector.sendText': '消息内容（发给目标会话）',
+				'inspector.target': '目标会话',
+				'inspector.fleetEmpty': '编制里还没有会话：切到「编制」页添加。',
+				'inspector.attachChanges': '附带本会话改动清单（仅统计文件工具写入，诚实标注盲区）',
+				'inspector.marker': '标记文本',
+				'inspector.waitTimeout': '等待超时（秒）',
+				'fleet.title': '编制',
+				'fleet.addSession': '添加会话',
+				'fleet.sessionId': '会话 ID',
+				'fleet.alias': '别名',
+				'fleet.role': '角色',
+				'fleet.note': '备注',
+				'fleet.status.running': '忙碌',
+				'fleet.status.idle': '空闲',
+				'fleet.status.offline': '不在线',
+				'fleet.sendTo': '发消息到…',
+				'fleet.waitFor': '等待…',
+				'fleet.drill': '钻入流程',
+				'fleet.remove': '移除',
+				'fleet.hops': '通信跳数',
+				'fleet.resetHops': '重置',
+				'fleet.outboxDead': '死信 {n}',
+				'fleet.retryOutbox': '重试死信',
+				'fleet.lastActive': '最近轮次',
+				'fleet.empty': '还没有会话。把要协作的会话 ID 加进来，然后在流程里用「发送消息 / 等待会话」连接它们。',
+				'fleet.viewFlow': '流程',
+				'fleet.viewFleet': '编制',
+				'fleet.backToFleet': '‹ 编制',
+				'fleet.self': '本会话',
+				'error.code.no-target': '目标会话不在编制中，也不是合法会话 ID',
+				'error.code.hop-limit': '通信跳数达到上限（可在编制页重置）',
+				'error.code.wait-timeout': '等待超时：目标没有在时限内满足条件',
+				'error.code.wait-stopped': '运行被停止，等待中断',
+				'error.code.fleet-duplicate': '该会话已在编制中',
 				'status.idle': '待运行',
 				'status.running': '执行中',
 				'status.completed': '完成',
@@ -221,6 +259,44 @@ window.__ModuleLoader__.load({
 				'child.timeout': 'timed out',
 				'child.cancelled': 'cancelled',
 				'child.interrupted': 'interrupted',
+				'kind.send': 'Send message',
+				'kind.wait': 'Wait session',
+				'until.idle': 'wait until idle',
+				'until.marker': 'wait for marker',
+				'inspector.sendText': 'Message text (delivered to the target session)',
+				'inspector.target': 'Target session',
+				'inspector.fleetEmpty': 'The fleet has no sessions yet: add one on the Fleet page.',
+				'inspector.attachChanges': 'Attach this session’s touched-file list (file tools only, blind spots labelled)',
+				'inspector.marker': 'Marker text',
+				'inspector.waitTimeout': 'Wait timeout (s)',
+				'fleet.title': 'Fleet',
+				'fleet.addSession': 'Add session',
+				'fleet.sessionId': 'Session ID',
+				'fleet.alias': 'Alias',
+				'fleet.role': 'Role',
+				'fleet.note': 'Note',
+				'fleet.status.running': 'busy',
+				'fleet.status.idle': 'idle',
+				'fleet.status.offline': 'offline',
+				'fleet.sendTo': 'send to…',
+				'fleet.waitFor': 'wait for…',
+				'fleet.drill': 'Open flow',
+				'fleet.remove': 'Remove',
+				'fleet.hops': 'send hops',
+				'fleet.resetHops': 'Reset',
+				'fleet.outboxDead': '{n} dead',
+				'fleet.retryOutbox': 'Retry dead',
+				'fleet.lastActive': 'last turn',
+				'fleet.empty': 'No sessions yet. Add the session ids you collaborate with, then connect them with Send / Wait steps inside the flows.',
+				'fleet.viewFlow': 'Flow',
+				'fleet.viewFleet': 'Fleet',
+				'fleet.backToFleet': '‹ Fleet',
+				'fleet.self': 'this session',
+				'error.code.no-target': 'the target session is not in the fleet and not a valid session id',
+				'error.code.hop-limit': 'the send-hop cap was reached (reset it on the Fleet page)',
+				'error.code.wait-timeout': 'wait timed out before the target satisfied the condition',
+				'error.code.wait-stopped': 'the run was stopped while waiting',
+				'error.code.fleet-duplicate': 'that session is already in the fleet',
 				'status.idle': 'Pending',
 				'status.running': 'Running',
 				'status.completed': 'Done',
@@ -335,9 +411,11 @@ window.__ModuleLoader__.load({
 			branch: C.warn,
 			loop: C.error,
 			checkpoint: C.dim,
+			send: C.accent,
+			wait: C.warn,
 		};
 
-		const KIND_ORDER = ['prompt', 'dispatch', 'model', 'command', 'branch', 'loop', 'checkpoint'];
+		const KIND_ORDER = ['prompt', 'dispatch', 'send', 'wait', 'model', 'command', 'branch', 'loop', 'checkpoint'];
 		const CHILD_COLOR = {
 			pending: C.dimmer,
 			running: C.accent,
@@ -612,6 +690,13 @@ window.__ModuleLoader__.load({
 					: node.collect === 'k-of-n' ? `${t('collect.kOfN')} k=${node.k || 1}` : t('collect.all');
 				const head = (typeof node.text === 'string' ? node.text.trim() : '').split('\n')[0].slice(0, 56);
 				return `${targets} 路 · ${collect}${head === '' ? '' : ` · ${head}`}`;
+			}
+			if (node.kind === 'send') {
+				const head = (typeof node.text === 'string' ? node.text.trim() : '').split('\n')[0].slice(0, 48);
+				return `→ ${node.target || node.targetRef || '?'}${head === '' ? '' : ` · ${head}`}`;
+			}
+			if (node.kind === 'wait') {
+				return `${node.until === 'marker' ? t('until.marker') : t('until.idle')} · ${node.target || node.targetRef || '?'}`;
 			}
 			if (node.kind === 'branch' || node.kind === 'loop') {
 				const type = node.condition === undefined ? 'always' : node.condition.type;
@@ -1658,6 +1743,67 @@ window.__ModuleLoader__.load({
 					})));
 			}
 
+			if (node.kind === 'send') {
+				rows.push(h(Field, { key: 'stext', label: t('inspector.sendText') },
+					h(PromptEditor, {
+						t,
+						sessionId: props.sessionId,
+						value: text,
+						onChangeText: setText,
+						onCommit: () => patch({ text }),
+					})));
+				rows.push(h(Field, { key: 'target', label: t('inspector.target') },
+					h(TargetSelect, {
+						t,
+						sessions: props.fleetSessions,
+						value: node.targetRef,
+						onChange: (targetRef) => patch({ targetRef }),
+					})));
+				rows.push(h('label', { key: 'attach', style: { display: 'flex', gap: '6px', alignItems: 'flex-start', fontSize: '11px', color: C.dim, lineHeight: '15px' } },
+					h('input', {
+						type: 'checkbox',
+						checked: node.attachChanges === true,
+						onChange: (event) => patch({ attachChanges: event.target.checked }),
+					}),
+					t('inspector.attachChanges')));
+			}
+
+			if (node.kind === 'wait') {
+				rows.push(h(Field, { key: 'target', label: t('inspector.target') },
+					h(TargetSelect, {
+						t,
+						sessions: props.fleetSessions,
+						value: node.targetRef,
+						onChange: (targetRef) => patch({ targetRef }),
+					})));
+				rows.push(h(Field, { key: 'until', label: '等待条件 / Until' },
+					h('select', {
+						value: node.until === 'marker' ? 'marker' : 'idle',
+						style: inputStyle,
+						onChange: (event) => patch({ until: event.target.value }),
+					},
+					h('option', { value: 'idle' }, t('until.idle')),
+					h('option', { value: 'marker' }, t('until.marker')))));
+				if (node.until === 'marker') {
+					rows.push(h(Field, { key: 'marker', label: t('inspector.marker') },
+						h('input', {
+							value: typeof node.marker === 'string' ? node.marker : '',
+							placeholder: '[[FLOW:REPORT',
+							style: inputStyle,
+							onChange: (event) => patch({ marker: event.target.value }),
+						})));
+				}
+				rows.push(h(Field, { key: 'wtimeout', label: t('inspector.waitTimeout') },
+					h('input', {
+						type: 'number',
+						min: 15,
+						max: 3600,
+						value: Math.round((node.timeoutMs || 900000) / 1000),
+						style: inputStyle,
+						onChange: (event) => patch({ timeoutMs: (Number(event.target.value) || 900) * 1000 }),
+					})));
+			}
+
 			if (node.kind === 'dispatch') {
 				rows.push(h(Field, { key: 'dtext', label: t('inspector.dispatchText') },
 					h(PromptEditor, {
@@ -1818,6 +1964,184 @@ window.__ModuleLoader__.load({
 
 		//#endregion
 
+		//#region fleet
+
+		/** Target picker for send/wait steps: one option per fleet session. */
+		function TargetSelect(props) {
+			const t = props.t;
+			const sessions = Array.isArray(props.sessions) ? props.sessions : [];
+			if (sessions.length === 0) {
+				return h('div', { style: { ...inputStyle, color: C.dimmer, cursor: 'default' } }, t('inspector.fleetEmpty'));
+			}
+			return h(
+				'select',
+				{
+					value: props.value === undefined || props.value === null ? '' : props.value,
+					style: inputStyle,
+					onChange: (event) => props.onChange(event.target.value),
+				},
+				h('option', { value: '' }, '—'),
+				sessions.map((session) =>
+					h('option', { key: session.nodeId, value: session.nodeId },
+						`${session.alias !== '' ? session.alias : session.sessionId.slice(0, 12)}${session.role !== '' ? ` · ${session.role}` : ''}`)),
+			);
+		}
+
+		function relativeTime(timestamp) {
+			if (!Number.isFinite(timestamp) || timestamp <= 0) return '—';
+			const delta = Math.max(0, Date.now() - timestamp);
+			const minutes = Math.floor(delta / 60000);
+			if (minutes < 1) return '<1m';
+			if (minutes < 60) return `${minutes}m`;
+			const hours = Math.floor(minutes / 60);
+			if (hours < 24) return `${hours}h`;
+			return `${Math.floor(hours / 24)}d`;
+		}
+
+		/**
+		 * The L0 fleet view: the workspace's sessions as cards (busy light,
+		 * role, outbox state), the communication edges between them, and
+		 * drill-down into any session's own flow graph.
+		 */
+		function FleetView(props) {
+			const t = props.t;
+			const data = props.data;
+			const [sessionIdInput, setSessionIdInput] = useState('');
+			const [aliasInput, setAliasInput] = useState('');
+			const [roleInput, setRoleInput] = useState('');
+			const sessions = data !== null && Array.isArray(data.sessions) ? data.sessions : [];
+			const fleet = data !== null && data.fleet !== undefined ? data.fleet : { edges: [], hops: 0 };
+			const maxHops = data !== null && Number.isFinite(data.maxHops) ? data.maxHops : 50;
+			const byNode = new Map(sessions.map((session) => [session.nodeId, session]));
+
+			const statusColorOf = (status) => (status === 'running' ? C.accent : status === 'idle' ? C.success : C.dimmer);
+			const edgesOf = (nodeId, direction) => fleet.edges.filter((edge) => (direction === 'out' ? edge.from === nodeId : edge.to === nodeId));
+			const deadTotal = sessions.reduce((sum, session) => sum + (session.outbox !== undefined ? session.outbox.dead : 0), 0);
+
+			const addSession = () => {
+				const id = sessionIdInput.trim();
+				if (id === '') return;
+				props.onOp({ op: 'session.add', targetSessionId: id, alias: aliasInput.trim(), role: roleInput.trim() });
+				setSessionIdInput('');
+				setAliasInput('');
+				setRoleInput('');
+			};
+
+			const edgeRow = (edge, direction) => {
+				const other = byNode.get(direction === 'out' ? edge.to : edge.from);
+				if (other === undefined) return null;
+				const arrow = direction === 'out' ? '→' : '←';
+				return h('span', {
+					key: edge.id,
+					title: `${edge.kind} · ${other.sessionId}`,
+					style: {
+						fontSize: '10px',
+						lineHeight: '16px',
+						padding: '0 6px',
+						borderRadius: '999px',
+						border: `1px solid ${edge.kind === 'wait' ? C.warn : C.accent}`,
+						color: edge.kind === 'wait' ? C.warn : C.accent,
+						cursor: 'pointer',
+						whiteSpace: 'nowrap',
+					},
+					onClick: () => props.onOp({ op: 'edge.remove', id: edge.id }),
+				}, `${arrow} ${other.alias !== '' ? other.alias : other.sessionId.slice(0, 10)} · ${edge.kind === 'send' ? '发' : '等'} ✕`);
+			};
+
+			const others = (nodeId) => sessions.filter((session) => session.nodeId !== nodeId);
+
+			const card = (session) => h(
+				'div',
+				{
+					key: session.nodeId,
+					style: {
+						border: `1px solid ${session.sessionId === props.selfSessionId ? C.accent : C.border}`,
+						borderRadius: '9px',
+						padding: '7px 9px',
+						display: 'flex',
+						flexDirection: 'column',
+						gap: '5px',
+					},
+				},
+				h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
+					h(StatusDot, { color: statusColorOf(session.agentStatus), pulse: session.agentStatus === 'running' }),
+					h('span', { style: { fontSize: '12px', fontWeight: 600, color: C.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+						session.alias !== '' ? session.alias : session.sessionId.slice(0, 14)),
+					session.role !== '' ? h('span', { style: { fontSize: '10px', border: `1px solid ${C.border}`, borderRadius: '999px', padding: '0 6px', color: C.dim } }, session.role) : null,
+					session.sessionId === props.selfSessionId ? h('span', { style: { fontSize: '10px', color: C.accent } }, t('fleet.self')) : null,
+					h('span', { style: { flex: 1 } }),
+					h('span', { title: session.sessionId, style: { fontSize: '10px', color: C.dimmer } }, session.sessionId.slice(0, 8)),
+					h(Button, { compact: true, onClick: () => props.onDrill(session.sessionId) }, t('fleet.drill')),
+					h(Button, { compact: true, danger: true, title: t('fleet.remove'), onClick: () => props.onOp({ op: 'session.remove', nodeId: session.nodeId }) }, '×')),
+				h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px', alignItems: 'center' } },
+					h('span', { style: { fontSize: '10px', color: C.dim } }, t(`fleet.status.${session.agentStatus || 'offline'}`)),
+					h('span', { style: { fontSize: '10px', color: C.dimmer } }, `${t('fleet.lastActive')} ${relativeTime(session.lastTurnEndAt)}`),
+					session.outbox !== undefined && session.outbox.dead > 0
+						? h(Button, { compact: true, onClick: () => props.onOp({ op: 'outbox.retry', targetSessionId: session.sessionId }) }, `${t('fleet.outboxDead', { n: session.outbox.dead })} ↻`)
+						: null),
+				edgesOf(session.nodeId, 'out').length + edgesOf(session.nodeId, 'in').length > 0
+					? h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px' } },
+						...edgesOf(session.nodeId, 'out').map((edge) => edgeRow(edge, 'out')),
+						...edgesOf(session.nodeId, 'in').map((edge) => edgeRow(edge, 'in')))
+					: null,
+				others(session.nodeId).length > 0
+					? h('div', { style: { display: 'flex', gap: '5px', flexWrap: 'wrap' } },
+						h('select', {
+							style: { ...inputStyle, flex: 1, minWidth: '80px', fontSize: '11px' },
+							value: '',
+							onChange: (event) => { if (event.target.value !== '') props.onOp({ op: 'edge.add', from: session.nodeId, to: event.target.value, kind: 'send' }); },
+						},
+						h('option', { value: '' }, `+ ${t('fleet.sendTo')}`),
+						others(session.nodeId).map((other) => h('option', { key: other.nodeId, value: other.nodeId }, other.alias !== '' ? other.alias : other.sessionId.slice(0, 12)))),
+						h('select', {
+							style: { ...inputStyle, flex: 1, minWidth: '80px', fontSize: '11px' },
+							value: '',
+							onChange: (event) => { if (event.target.value !== '') props.onOp({ op: 'edge.add', from: session.nodeId, to: event.target.value, kind: 'wait' }); },
+						},
+						h('option', { value: '' }, `+ ${t('fleet.waitFor')}`),
+						others(session.nodeId).map((other) => h('option', { key: other.nodeId, value: other.nodeId }, other.alias !== '' ? other.alias : other.sessionId.slice(0, 12)))))
+					: null,
+			);
+
+			return h(
+				'div',
+				{ style: { flex: 1, minHeight: 0, overflowY: 'auto', padding: '9px 10px', display: 'flex', flexDirection: 'column', gap: '8px' } },
+				h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
+					h(Chip, { color: fleet.hops >= maxHops ? C.error : C.dim }, `${t('fleet.hops')} ${fleet.hops}/${maxHops}`),
+					h('span', { style: { flex: 1 } }),
+					deadTotal > 0 ? h('span', { style: { fontSize: '10px', color: C.error } }, t('fleet.outboxDead', { n: deadTotal })) : null,
+					h(Button, { compact: true, disabled: props.busy, onClick: () => props.onOp({ op: 'reset-hops' }) }, t('fleet.resetHops'))),
+				h('div', { style: { display: 'flex', gap: '5px', flexWrap: 'wrap' } },
+					h('input', {
+						value: sessionIdInput,
+						placeholder: t('fleet.sessionId'),
+						style: { ...inputStyle, flex: '1 1 110px', minWidth: 0, fontSize: '11px' },
+						onChange: (event) => setSessionIdInput(event.target.value),
+						onKeyDown: (event) => { if (event.key === 'Enter') addSession(); },
+					}),
+					h('input', {
+						value: aliasInput,
+						placeholder: t('fleet.alias'),
+						style: { ...inputStyle, flex: '1 1 70px', minWidth: 0, fontSize: '11px' },
+						onChange: (event) => setAliasInput(event.target.value),
+						onKeyDown: (event) => { if (event.key === 'Enter') addSession(); },
+					}),
+					h('input', {
+						value: roleInput,
+						placeholder: t('fleet.role'),
+						style: { ...inputStyle, flex: '1 1 60px', minWidth: 0, fontSize: '11px' },
+						onChange: (event) => setRoleInput(event.target.value),
+						onKeyDown: (event) => { if (event.key === 'Enter') addSession(); },
+					}),
+					h(Button, { compact: true, disabled: props.busy || sessionIdInput.trim() === '', onClick: addSession }, `+${t('fleet.addSession')}`)),
+				sessions.length === 0
+					? h('div', { style: { fontSize: '11px', color: C.dimmer, lineHeight: '17px' } }, t('fleet.empty'))
+					: sessions.map((session) => card(session)),
+			);
+		}
+
+		//#endregion
+
 		//#region sidebar editor
 
 		function FlowQueuePanel(props) {
@@ -1833,6 +2157,13 @@ window.__ModuleLoader__.load({
 			const [menuOpen, setMenuOpen] = useState(false);
 			const [busy, setBusy] = useState(false);
 			const [error, setError] = useState(null);
+			// L0/L1 layering: 'fleet' shows the workspace sessions, 'flow' shows
+			// a graph — the panel's own session, or any fleet session after a
+			// drill-down.
+			const [view, setView] = useState('flow');
+			const [drill, setDrill] = useState(null);
+			const [fleetData, setFleetData] = useState(null);
+			const activeSessionId = typeof drill === 'string' && drill !== '' ? drill : sessionId;
 			const [localPos, setLocalPos] = useState({});
 
 			useEffect(() => {
@@ -1844,7 +2175,7 @@ window.__ModuleLoader__.load({
 
 			const refresh = useCallback(() => {
 				if (sessionId === '') return Promise.resolve();
-				return readState(sessionId)
+				return readState(activeSessionId)
 					.then((value) => {
 						if (!mounted.current) return;
 						setSnapshot(value);
@@ -1853,21 +2184,56 @@ window.__ModuleLoader__.load({
 					.catch((err) => {
 						if (mounted.current) setError(err.message || String(err));
 					});
+			}, [sessionId, activeSessionId]);
+
+			const refreshFleet = useCallback(() => {
+				if (sessionId === '') return;
+				requestJson(`/flow-queue/api/fleet?sessionId=${encodeURIComponent(sessionId)}`)
+					.then((data) => {
+						if (!mounted.current) return;
+						if (data !== null && data !== undefined && data.ok === true) setFleetData(data.value);
+					})
+					.catch(() => {});
 			}, [sessionId]);
 
 			useEffect(() => {
 				if (sessionId === '') return undefined;
 				refresh();
+				refreshFleet();
 				readModels().then((value) => { if (mounted.current) setModels(value); }).catch(() => {});
 				readPackages().then((value) => { if (mounted.current) setPackages(Array.isArray(value) ? value : []); }).catch(() => {});
-				const handle = setInterval(refresh, POLL_MS);
+				const handle = setInterval(() => {
+					refresh();
+					refreshFleet();
+				}, POLL_MS);
 				return () => clearInterval(handle);
-			}, [refresh, sessionId]);
+			}, [refresh, refreshFleet, sessionId]);
+
+			const fleetOp = useCallback((payload) => {
+				if (sessionId === '') return Promise.resolve();
+				setBusy(true);
+				return requestJson('/flow-queue/api/fleet', {
+					method: 'POST',
+					headers: { 'content-type': 'application/json' },
+					body: JSON.stringify({ sessionId, ...payload }),
+				})
+					.then(() => {
+						if (!mounted.current) return;
+						setError(null);
+					})
+					.catch((err) => {
+						if (mounted.current) setError(err.message || String(err));
+					})
+					.finally(() => {
+						if (mounted.current) setBusy(false);
+						refreshFleet();
+					});
+			}, [sessionId, refreshFleet]);
 
 			const run = useCallback((payload) => {
 				if (sessionId === '') return Promise.resolve();
 				setBusy(true);
-				return postCommand({ sessionId, ...payload })
+				return postCommand({ sessionId: activeSessionId, ...payload })
 					.then((value) => {
 						if (!mounted.current) return;
 						if (value !== null && value !== undefined && value.state !== undefined) setSnapshot(value.state);
@@ -1881,7 +2247,7 @@ window.__ModuleLoader__.load({
 					.finally(() => {
 						if (mounted.current) setBusy(false);
 					});
-			}, [sessionId, refresh]);
+			}, [sessionId, activeSessionId, refresh]);
 
 			const reloadPackages = useCallback(() => {
 				readPackages()
@@ -2008,8 +2374,23 @@ window.__ModuleLoader__.load({
 					},
 				},
 				h('span', { style: { color: C.accent, display: 'flex' } }, h(Glyph, { size: 16 })),
+				view === 'fleet' || drill !== null
+					? h(Button, {
+						compact: true,
+						title: t('fleet.backToFleet'),
+						onClick: () => {
+							setDrill(null);
+							setView('fleet');
+							setSelected('');
+							setLocalPos({});
+						},
+					}, t('fleet.backToFleet'))
+					: null,
 				h('span', { style: { fontSize: '13px', fontWeight: 600, color: C.text } }, t('tab.title')),
-				h(Chip, { color: runColor(runState) }, t(`run.${runState}`)),
+				drill !== null ? h('span', { title: drill, style: { fontSize: '10px', color: C.dimmer } }, drill.slice(0, 10)) : null,
+				h(Button, { compact: true, primary: view === 'flow', onClick: () => setView('flow') }, t('fleet.viewFlow')),
+				h(Button, { compact: true, primary: view === 'fleet', onClick: () => { setView('fleet'); setSelected(''); } }, t('fleet.viewFleet')),
+				view === 'flow' ? h(Chip, { color: runColor(runState) }, t(`run.${runState}`)) : null,
 				h('span', { style: { flex: 1 } }),
 				primaryAction,
 				runState === 'running' || runState === 'waiting'
@@ -2145,10 +2526,11 @@ window.__ModuleLoader__.load({
 					{ style: { flex: 1, minHeight: 0, overflowY: 'auto', padding: '8px 10px' } },
 					h(Inspector, {
 						t,
-						sessionId,
+						sessionId: activeSessionId,
 						node: selectedNode,
 						catalog: models,
 						busy,
+						fleetSessions: fleetData !== null && Array.isArray(fleetData.sessions) ? fleetData.sessions : [],
 						onPatch: (id, patch) => void run({ op: 'node.update', id, patch }),
 						onDetach: (id, attachmentId) => void run({ op: 'node.detach', id, attachmentId }),
 						onUpload: (id, kind, file) => {
@@ -2216,7 +2598,23 @@ window.__ModuleLoader__.load({
 			// The canvas always stays mounted: a click only opens the inspector
 			// drawer underneath it, so dragging a step or dragging a connection is
 			// never interrupted by a layout swap.
-			const body = sheet === 'library'
+			const fleetArea = h(FleetView, {
+				t,
+				selfSessionId: sessionId,
+				data: fleetData,
+				busy,
+				onOp: fleetOp,
+				onDrill: (targetSessionId) => {
+					setDrill(targetSessionId);
+					setView('flow');
+					setSelected('');
+					setLocalPos({});
+				},
+			});
+
+			const body = view === 'fleet'
+				? fleetArea
+				: sheet === 'library'
 				? libraryArea
 				: h(
 					'div',
@@ -2237,7 +2635,7 @@ window.__ModuleLoader__.load({
 				'div',
 				{ style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, color: C.text, fontFamily: 'inherit' } },
 				header,
-				palette,
+				view === 'flow' ? palette : null,
 				body,
 				error !== null ? h('div', { style: { padding: '6px 10px', borderTop: `1px solid ${C.border}`, fontSize: '11px', color: C.error } }, error) : null,
 				footer,

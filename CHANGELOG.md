@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here.
 
+## 0.6.0 — 2026-11-06
+
+- The panel is now two layers. A **Fleet** view (L0) lists the workspace's collaborating sessions as cards — busy light, role, last turn, per-target outbox state — with send/wait edges between them and drill-down into any session's own flow; the header toggles **Flow / Fleet**, and a drilled-in flow shows a `‹ Fleet` breadcrumb.
+- New step `Send message`: delivers one message to another fleet session at its own turn boundary. The message is **persisted before delivery** (`outbox/<target>.jsonl`), retried with backoff (2 s doubling to 60 s, 5 attempts), and **strictly ordered per target** — a dead letter blocks its queue until revived from the fleet view.
+- New step `Wait session`: waits until the target finished a turn after the wait started and is idle (`idle`), or until the target's latest turn text contains a marker (`marker`, default `[[FLOW:REPORT`). One timeout (15 s–60 min, default 15 min) fails the step honestly as `wait-timeout`; `Stop` cancels it (`wait-stopped`).
+- **Change attribution block** (honest v1): a send may attach the paths this session's file tools touched during the run — tracked from the recorder's own `fs/write-intent` / `fs/edit-intent` events (subagent edits fold into the parent), method-labelled `intent-only` / `handoff-only`, blind spots (shell-only edits, other sessions' concurrent edits) named in the block. Never a guess, never a window diff.
+- Guardrail shipped with the feature: per-fleet **send-hop cap** (default 50, exceeded sends fail as `hop-limit`; reset from the fleet view).
+- New Host route `GET/POST /flow-queue/api/fleet` (fleet CRUD, edges, hops, outbox retry). Tests: five new scenarios (outbox delivery + fleet CRUD round-trip; backoff → dead letter blocks order → revive delivers in order; wait-idle; wait-marker incl. a markerless turn that must not release; hop cap + the attribution block), 20 in total.
+
 ## 0.5.0 — 2026-11-06
 
 - New step type `Fan-out`: one shared prompt goes to up to 8 throwaway subagents through the in-process `spawn` backend. Each lane may force its own provider/model/reasoning effort (passed as the child's `agentOptions`); an empty lane inherits the session route. Collection is `all`, `k-of-n` (cancel the stragglers once k finish) or `first`; each lane's output is aggregated into the flow outcome, so the next branch, judge or loop reads one document.
