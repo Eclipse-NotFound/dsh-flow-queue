@@ -30,7 +30,7 @@ Then restart the Harness web runtime — bundles are composed at startup — and
 
 Click that icon, or the "Flow queue" card on the right sidebar's start page. The right sidebar gains a "Flow queue" tab, and the canvas lives inside it. Next to the title sit two view toggles, "Flow" and "Fleet" — this tour stays on "Flow" ("Fleet" manages the workspace's collaborating sessions).
 
-**Check**: the run chip beside the title reads "Idle"; the "Start" button on the far right is greyed out while the canvas is empty, with the `⋯` menu next to it; the panel footer shows `v0.7.0`.
+**Check**: the run chip beside the title reads "Idle"; the Start button on the top bar's right side is greyed out while the canvas is empty (the `⋯` menu sits farthest right); the panel footer shows `v0.7.0`.
 
 ### 3. Add three cards
 
@@ -50,7 +50,7 @@ Clicking a card (a press that does not move) opens its inspector drawer under th
 
 ### 5. Connect
 
-Drag from the Prompt card's right dot onto the Model-switch card (or click the dot, then click the target card), then connect Model switch to Branch. Prompt and Model switch have one output dot (hover: "Next"); Branch has two, "Yes" and "No". To make the branch's direction visible, add a `+Checkpoint` card and connect "Yes" to it.
+Drag from the Prompt card's right dot onto the Model-switch card (or click the dot, then click the target card), then connect Model switch to Branch. Prompt and Model switch have one output dot (hover: "Next · Click a connection to remove it"); Branch has two, "Yes" and "No". To make the branch's direction visible, add a `+Checkpoint` card and connect "Yes" to it.
 
 **Check**: the three cards are chained by two connections; with the checkpoint added, the "Yes" dot carries a connection too.
 
@@ -73,7 +73,7 @@ To reuse this flow later, save it via `⋯ → Packages`; all nine step types ar
 The plugin registers one right-sidebar tab, and the whole canvas lives inside it — no separate window:
 
 - **Top row** — run state, start / pause / resume / stop, and a `⋯` menu (auto layout, packages, reset, clear).
-- **Second row** — `+Prompt` `+Model` `+Command` `+Branch` `+Loop` `+Checkpoint`; one click adds a step.
+- **Second row** — `+Prompt` `+Fan-out` `+Send message` `+Wait session` `+Model switch` `+Command` `+Branch` `+Loop` `+Checkpoint`; one click adds a step.
 - **Canvas** — the whole card is the drag handle; drag from a card's right dot onto another card to connect (branches and loops expose two output dots: yes/no, again/exit), or click the dot and then click the target card; click a connection to remove it; drag empty canvas to pan, and `−` / `+` / `⤢` at the bottom-right control zoom.
 - **Select a step** — a click (a press that does not move) opens that step's inspector as a drawer under the canvas, so the canvas keeps its place and dragging is never interrupted; the drawer header offers "run from here" / "delete", and ↓ closes it.
 - **Packages** — `⋯ → Packages` saves, loads and deletes reusable flows in the same panel.
