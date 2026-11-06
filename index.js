@@ -2778,7 +2778,14 @@ export function apply(ctx, config = {}) {
 				edges: [{ id: newId('e'), from: promptId, port: 'next', to: waitId }],
 			};
 			await writeFile(path.join(packageDir, 'report-protocol.json'), JSON.stringify(body, null, '\t'), { encoding: 'utf8', flag: 'wx' });
-
+		} catch {
+			/* already present, or the package dir is read-only: either way the
+			   library simply lists what is on disk */
+		}
+		// Each builtin gets its own write-once guard: one package already on
+		// disk (written by an older version) must not block another from
+		// shipping — a shared try would abort on the first EEXIST.
+		try {
 			const READY = '\\[\\[FLOW:REPORT ready\\]\\]';
 			const workerText = [
 				'【角色】worker（执行者），本工单由流程队列 superagent 方案包派发。',

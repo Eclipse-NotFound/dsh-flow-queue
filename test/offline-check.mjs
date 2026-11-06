@@ -8,7 +8,7 @@
 //   node test/offline-check.mjs
 
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -43,6 +43,13 @@ async function waitFor(predicate, label, timeoutMs = 5000) {
 
 async function makeHarness(options = {}) {
 	const stateDir = await mkdtemp(path.join(tmpdir(), 'flow-queue-'));
+	// Production profiles already carry report-protocol.json from 0.7.0; a
+	// preseeded copy reproduces that (a shared write-once try once let the
+	// first EEXIST block the superagent package from ever shipping).
+	if (options.preseedReportProtocol === true) {
+		await mkdir(path.join(stateDir, 'packages'), { recursive: true });
+		await writeFile(path.join(stateDir, 'packages', 'report-protocol.json'), '{"id":"report-protocol","nodes":[]}', 'utf8');
+	}
 	const routes = new Map();
 	const listeners = new Map();
 	const calls = { selectModel: [], prompt: [], command: [], startActivation: [] };
@@ -1074,7 +1081,7 @@ async function cleanup(harness) {
 //#region scenario 23: the superagent package ships, loads, and takes {{var}} fills
 
 {
-	const h = await makeHarness();
+	const h = await makeHarness({ preseedReportProtocol: true });
 	let entry;
 	for (let attempt = 0; attempt < 100 && entry === undefined; attempt += 1) {
 		const listed = await h.call(ROUTES.packages);
