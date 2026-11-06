@@ -19,6 +19,9 @@ window.__ModuleLoader__.load({
 		const POLL_MS = 1200;
 		const NODE_W = 196;
 		const PORT_GAP = 22;
+		// Keep in sync with package.json. Shown in the panel footer so the page's
+		// running build is identifiable at a glance during remote diagnosis.
+		const CLIENT_VERSION = '0.2.6';
 
 		let localeSvc = null;
 		let pluginCtx = null;
@@ -75,6 +78,7 @@ window.__ModuleLoader__.load({
 				'inspector.modelInherit': '不设置（沿用当前）',
 				'inspector.reasoning': '思考强度',
 				'inspector.reasoningDefault': '模型默认',
+				'inspector.reasoningNone': '该模型未声明思考档位',
 				'inspector.note': '断点说明',
 				'inspector.condition': '条件',
 				'inspector.conditionValue': '匹配内容',
@@ -184,6 +188,7 @@ window.__ModuleLoader__.load({
 				'inspector.modelInherit': 'Not set (keep current)',
 				'inspector.reasoning': 'Reasoning effort',
 				'inspector.reasoningDefault': 'Model default',
+				'inspector.reasoningNone': 'This model declares no reasoning levels',
 				'inspector.note': 'Checkpoint note',
 				'inspector.condition': 'Condition',
 				'inspector.conditionValue': 'Match value',
@@ -580,7 +585,11 @@ window.__ModuleLoader__.load({
 					onPointerDown: (event) => {
 						event.stopPropagation();
 						event.preventDefault();
-						props.onStart(props.port, event);
+						// Three arguments: the owning node's id travels with the port.
+						// Calling back with only (port, event) made every connection
+						// carry the port name as the source node id, which the Host
+						// rightly rejected — connections never worked.
+						props.onStart(props.nodeId, props.port, event);
 					},
 					title: props.title,
 					style: {
@@ -678,6 +687,7 @@ window.__ModuleLoader__.load({
 				portsOf(node).map((port, index) =>
 					h(OutputPort, {
 						key: port,
+						nodeId: node.id,
 						port,
 						top: 17 + index * PORT_GAP,
 						color: status === 'failed' ? C.error : C.border,
@@ -1035,11 +1045,18 @@ window.__ModuleLoader__.load({
 			);
 		}
 
-		/** Reasoning-effort picker for one provider/model, hidden when unsupported. */
+		/** Reasoning-effort picker; a selected model always yields a visible row. */
 		function EffortSelect(props) {
 			const t = props.t;
+			const hasModel = typeof props.provider === 'string' && props.provider !== '' && typeof props.model === 'string' && props.model !== '';
+			if (!hasModel) return null;
 			const efforts = effortsOf(props.catalog, props.provider, props.model);
-			if (efforts.length === 0) return null;
+			// Never silently hide the control: a model without declared levels gets
+			// an explicit note, so "no picker" always means "no model chosen".
+			if (efforts.length === 0) {
+				return h(Field, { label: t('inspector.reasoning') },
+					h('div', { style: { ...inputStyle, color: C.dimmer, cursor: 'default' } }, t('inspector.reasoningNone')));
+			}
 			const defaultEffort = catalogModel(props.catalog, props.provider, props.model).reasoning;
 			const defaultValue = defaultEffort !== undefined && defaultEffort !== null && typeof defaultEffort.defaultEffort === 'string' ? defaultEffort.defaultEffort : '';
 			const current = typeof props.value === 'string' && props.value !== '' ? props.value : '';
@@ -1732,6 +1749,7 @@ window.__ModuleLoader__.load({
 				{ style: { borderTop: `1px solid ${C.border}`, padding: '5px 10px', display: 'flex', alignItems: 'center', gap: '6px' } },
 				h('span', { style: { fontSize: '10px', color: C.dimmer, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, t('hint.boundary')),
 				h('span', { style: { fontSize: '10px', color: C.dimmer, whiteSpace: 'nowrap' } }, t('run.steps', { n: steps })),
+				h('span', { style: { fontSize: '10px', color: C.dimmer, whiteSpace: 'nowrap', opacity: 0.7 } }, `v${CLIENT_VERSION}`),
 			);
 
 			return h(

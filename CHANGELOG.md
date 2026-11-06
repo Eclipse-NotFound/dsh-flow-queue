@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## 0.2.6 — 2026-11-06
+
+- Fix: connections never worked in any version. The output port called its start handler with only `(port, event)`, so the drag carried the port name as the source node id and the Host rightly rejected the edge (`no such node`). The port now passes the owning node's id with the port.
+- The reasoning-effort row is now always visible once a model is chosen: models that declare levels get the dropdown; models that declare none (a hand-written provider entry, for example) get an explicit note instead of a silently missing control.
+- The panel footer shows the client build (`v0.2.6`), so a stale page is identifiable at a glance.
+
 ## 0.2.5 — 2026-11-06
 
 - Fix: dragging never moved a card and every press opened the inspector. The "did this gesture move" check read `start.x`/`start.y` while the press point is stored as `startX`/`startY`, so the comparison was `NaN > 4` — always false. Every release therefore counted as a click, and connection drags never completed either. Both now read the stored fields.
