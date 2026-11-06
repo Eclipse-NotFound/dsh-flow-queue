@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## 0.2.5 — 2026-11-06
+
+- Fix: dragging never moved a card and every press opened the inspector. The "did this gesture move" check read `start.x`/`start.y` while the press point is stored as `startX`/`startY`, so the comparison was `NaN > 4` — always false. Every release therefore counted as a click, and connection drags never completed either. Both now read the stored fields.
+- Fix: the `⋯` menu items (auto layout, packages, reset, clear) never ran. The outside-press close listener was attached to `document` `pointerdown` without excluding the menu itself, so the menu was removed before the item's `click` landed. The menu region and its trigger are now marked and excluded from closing.
+- A committed drag keeps its local position until the server state returns, so a card no longer snaps back to its old spot for a beat; loading a package or clearing the graph drops locally cached positions so a reused node id renders at the loaded position.
+
 ## 0.2.4 — 2026-11-05
 
 - Editing no longer takes the canvas away: a click opens the inspector as a drawer under the canvas, so dragging a step is never interrupted by a layout swap. A press that does not move counts as the click; the whole card is the drag handle.

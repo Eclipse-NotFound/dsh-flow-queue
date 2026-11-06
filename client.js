@@ -414,6 +414,7 @@ window.__ModuleLoader__.load({
 					disabled,
 					title: props.title,
 					'aria-label': props.title,
+					'data-fq-menu': props['data-fq-menu'],
 				},
 				props.children,
 			);
@@ -753,7 +754,9 @@ window.__ModuleLoader__.load({
 			// One stable set of document listeners: dragging, panning and connecting
 			// read the live refs, so a re-render never drops a pointer event.
 			useEffect(() => {
-				const movedEnough = (start, event) => Math.abs(event.clientX - start.x) + Math.abs(event.clientY - start.y) > 4;
+				// drag/connect records store the press point as startX/startY; reading
+				// the wrong field here made every gesture look like "no movement".
+				const movedEnough = (start, event) => Math.abs(event.clientX - start.startX) + Math.abs(event.clientY - start.startY) > 4;
 				const cardUnder = (event) => {
 					const target = event.target !== null && event.target !== undefined && event.target.closest !== undefined
 						? event.target.closest('[data-fq-node]')
@@ -1391,7 +1394,13 @@ window.__ModuleLoader__.load({
 
 			useEffect(() => {
 				if (!menuOpen) return undefined;
-				const close = () => setMenuOpen(false);
+				// Close only on a press outside the menu region: closing on the items
+				// themselves removed them before the click landed, so no item ever ran.
+				const close = (event) => {
+					const target = event.target;
+					if (target !== null && target !== undefined && target.closest !== undefined && target.closest('[data-fq-menu]') !== null) return;
+					setMenuOpen(false);
+				};
 				const handle = setTimeout(() => document.addEventListener('pointerdown', close), 0);
 				return () => {
 					clearTimeout(handle);
@@ -1419,11 +1428,8 @@ window.__ModuleLoader__.load({
 			const commitMove = (id) => {
 				const position = localPos[id];
 				if (position === undefined) return;
-				setLocalPos((current) => {
-					const next = { ...current };
-					delete next[id];
-					return next;
-				});
+				// Keep the local position in place until the server state returns:
+				// dropping it first made the card snap back to its old spot for a beat.
 				void run({ op: 'node.update', id, patch: { x: position.x, y: position.y } });
 			};
 			const cancelMove = () => {
@@ -1515,12 +1521,14 @@ window.__ModuleLoader__.load({
 				h(Button, {
 					compact: true,
 					title: t('action.menu'),
+					'data-fq-menu': 'trigger',
 					onClick: () => setMenuOpen((value) => !value),
 				}, '⋯'),
 				menuOpen
 					? h(
 						'div',
 						{
+							'data-fq-menu': 'panel',
 							style: {
 								position: 'absolute',
 								right: '8px',
@@ -1545,6 +1553,7 @@ window.__ModuleLoader__.load({
 						menuItem(t('action.reset'), () => void run({ op: 'graph.reset' })),
 						menuItem(t('action.clear'), () => {
 							setSelected('');
+							setLocalPos({});
 							void run({ op: 'graph.clear' });
 						}, true),
 					)
@@ -1689,6 +1698,9 @@ window.__ModuleLoader__.load({
 								.then((value) => {
 									if (!mounted.current) return;
 									setSnapshot(value);
+									// A loaded package reuses node ids: drop locally cached
+									// positions so the loaded layout is what renders.
+									setLocalPos({});
 									setSelected('');
 									setSheet('');
 								})
